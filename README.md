@@ -77,6 +77,8 @@ conservative (such a tab is never evicted, and counts as seen on every tick).
 Eviction: compare-and-set the row to `evicting`, re-check the guards, SIGTERM, SIGKILL only
 after `term_grace_s` (15 s, logged as an INCIDENT). The tab gets a banner, the title
 `[zz] <title>`, and the resume command typed but not run. Focusing that tab later runs it.
+A tab counts as at a shell when iTerm2's job name is a shell or the tty's foreground
+process group (from `ps`) is one: the job name can keep naming the exited claude.
 
 ## Install
 
@@ -174,7 +176,7 @@ path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file tha
 | `stale_busy_min` | 30 | busy this long + Esc-interrupted transcript = idle |
 | `helper_patterns` | `["mcp", "npm exec ", "/.bin/", "-mcp"]` | child processes that are not work (hook runners always are not; a shell-snapshot shell always is) |
 | `cron_recurring_block_h` | 24 | hours a non-durable recurring cron job keeps its session |
-| `on_evict` | null | executable run after an eviction with `CC_SESSION_ID`, `CC_SESSION_CWD`, `CC_SESSION_TITLE`, `CC_EVICT_OUTCOME` |
+| `on_evict` | null | executable run after an eviction with `CC_SESSION_ID`, `CC_SESSION_CWD`, `CC_SESSION_TITLE`, `CC_EVICT_OUTCOME`; an eviction whose hook never ran (daemon stopped mid-pass) gets it replayed on a later tick while the session is still hibernated, so the hook must be safe to run twice |
 | `daemon_python` | `~/.claude/venvs/iterm2/bin/python` | python with `iterm2` |
 | `resume_command` | installed `cc-resume` | what gets typed into tabs |
 | `worktree_marker` | `/.claude/worktrees/` | worktree folder marker (cc-resume) |

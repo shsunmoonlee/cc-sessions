@@ -209,7 +209,7 @@ class Item3Migration(TempEnv):
             PRAGMA user_version=1;""")
         c.close()
         conn = ledger.connect(path)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
         cols = {r[1]: r[2] for r in conn.execute("PRAGMA table_info(sessions)")}
         self.assertEqual(cols["pid_start"], "INTEGER")
         self.assertIn("held_state", cols)

@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts REAL, session_id TE
   event TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS evictions(id INTEGER PRIMARY KEY, session_id TEXT, ts REAL,
-  pid INTEGER, free_pct REAL, rss_mb REAL, signal TEXT, outcome TEXT, detail TEXT);
+  pid INTEGER, free_pct REAL, rss_mb REAL, signal TEXT, outcome TEXT, detail TEXT, hook_at REAL);
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, ts REAL, kind TEXT,
   session_id TEXT, done_at REAL, result TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -133,8 +133,10 @@ def connect(path, readonly=False):
                 for stmt in SCHEMA.strip().split(";"):
                     if stmt.strip():
                         conn.execute(stmt)
-            elif v == 1:
-                migrate_v1_to_v2(conn)
+            elif v in (1, 2):
+                if v == 1:
+                    migrate_v1_to_v2(conn)
+                migrate_v2_to_v3(conn)
             elif v != SCHEMA_VERSION:
                 raise LedgerError("ledger schema %s is newer than this code (%s)" % (v, SCHEMA_VERSION))
             conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
@@ -155,6 +157,14 @@ def migrate_v1_to_v2(conn):
                  % (V1_COLUMNS, V1_COLUMNS))
     conn.execute("DROP TABLE sessions_v1")
     conn.execute(SESSIONS_INDEX)
+
+
+def migrate_v2_to_v3(conn):
+    """v2 -> v3 inside the caller's transaction: evictions.hook_at, stamped when the
+    on_evict hook has run for that eviction. Rows that predate it count as run, so the
+    first v3 daemon replays nothing."""
+    conn.execute("ALTER TABLE evictions ADD COLUMN hook_at REAL")
+    conn.execute("UPDATE evictions SET hook_at=ts")
 
 
 @contextlib.contextmanager
@@ -390,6 +400,28 @@ def finish_eviction(conn, eviction_id, outcome, signal=None, detail=None):
         else:
             conn.execute("UPDATE evictions SET outcome=?, detail=? WHERE id=?",
                          (outcome, detail, eviction_id))
+
+
+def hook_done(conn, eviction_id, now=None):
+    """Stamp an eviction's on_evict hook as run (or as not needed)."""
+    if eviction_id is None:
+        return
+    now = time.time() if now is None else now
+    with tx(conn):
+        conn.execute("UPDATE evictions SET hook_at=? WHERE id=? AND hook_at IS NULL",
+                     (now, eviction_id))
+
+
+def pending_hooks(conn, older_than):
+    """Finished evictions whose on_evict hook never ran, started before `older_than`
+    (an eviction still preparing its tab is younger). Only each session's newest
+    eviction counts; older unstamped ones are superseded by it."""
+    return [row_dict(r) for r in conn.execute(
+        "SELECT e.id AS eviction_id, e.outcome, s.* FROM evictions e "
+        "JOIN sessions s ON s.session_id = e.session_id "
+        "WHERE e.hook_at IS NULL AND e.outcome NOT IN ('started', 'aborted') AND e.ts < ? "
+        "AND e.id = (SELECT MAX(id) FROM evictions WHERE session_id = e.session_id) "
+        "ORDER BY e.id", (older_than,))]
 
 
 def rollback_eviction(conn, sid, prev_state, now=None, prev_since=None):

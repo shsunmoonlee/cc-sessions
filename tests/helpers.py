@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "lib"))
@@ -21,7 +22,7 @@ os.environ["CC_SESSIONS_CONFIG"] = os.path.join(_SAFE, "never.json")
 os.environ["CC_SESSIONS_LOG"] = os.path.join(_SAFE, "never.log")
 REAL_LOG = os.path.expanduser("~/Library/Logs/cc-sessions.log")
 
-from ccsessions import config, ledger  # noqa: E402
+from ccsessions import config, ledger, procs  # noqa: E402
 
 _quiet = logging.getLogger("cc-sessions")
 _quiet.addHandler(logging.NullHandler())
@@ -51,6 +52,11 @@ class TempEnv(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ccs-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        # never read this machine's real ttys: tests opt in by setting self.foreground[tty]
+        self.foreground = {}
+        fg = mock.patch.object(procs, "foreground_job", lambda tty: self.foreground.get(procs.norm_tty(tty)))
+        fg.start()
+        self.addCleanup(fg.stop)
         self.db = os.path.join(self.tmp, "state", "cc-sessions.db")
         self.projects = os.path.join(self.tmp, "projects")
         os.makedirs(self.projects)

@@ -15,7 +15,7 @@ class LedgerTransitions(TempEnv):
         return ledger.apply_event(self.conn, event, payload, dict(proc) if proc else None, now)
 
     def test_schema_and_wal(self):
-        self.assertEqual(self.conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(self.conn.execute("PRAGMA user_version").fetchone()[0], 3)
         self.assertEqual(self.conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_unknown_session_creates_row_on_any_event(self):

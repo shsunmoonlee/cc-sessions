@@ -57,6 +57,9 @@ REQUEST_POLL_S = 5
 REAP_EVERY_S = 3600
 PRUNE_EVERY_S = 3600
 ON_EVICT_TIMEOUT_S = 30
+# an eviction finishes its tab + hook well inside this (term grace 15 + SessionEnd 5 +
+# tab wait 20 + hook 30 + slack); younger unstamped evictions may still be in flight
+HOOK_SWEEP_MIN_AGE_S = 180
 MAX_ABORTS_PER_PASS = 3
 ITERM_CALL_TIMEOUT_S = 5
 APP_CONNECT_TIMEOUT_S = ITERM_CALL_TIMEOUT_S * 3
@@ -287,6 +290,21 @@ def resume_decision(row, guid, tty, now, last_fire, job, identity_alive):
 
 def is_shell_job(job):
     return job in procs.SHELL_JOBS
+
+
+async def settled_job(job, tty, run):
+    """iTerm2's jobName, corrected by the kernel: after a process exits, jobName can keep
+    naming it (the claude binary is named after its version; MCP `node` children linger)
+    while the shell already holds the terminal. A non-shell jobName is replaced by the
+    tty's foreground group when that is a shell. `run(fn, *args)` runs ps off the loop.
+    Never turns a shell into a non-shell, and keeps jobName when ps cannot tell."""
+    if job is None or is_shell_job(job) or not tty:
+        return job
+    try:
+        fg = await run(procs.foreground_job, tty)
+    except Exception:
+        return job
+    return fg if fg is not None and is_shell_job(fg) else job
 
 
 class ConnectionLost(Exception):
@@ -630,7 +648,7 @@ class Evictor(object):
                 log.warning("evict %s: iTerm2 stopped answering while preparing the tab", sid[:8])
             except Exception:
                 log.exception("evict %s: preparing the tab failed", sid[:8])
-        self.run_on_evict(row, title, outcome)
+        self.run_on_evict(row, title, outcome, eid)
         if lost is not None:
             raise lost
         return outcome
@@ -682,10 +700,10 @@ class Evictor(object):
         # wall-clock bound: each job_name is an iTerm2 round trip that can itself be slow
         start = self.clock()
         deadline = start + TAB_SHELL_WAIT_S
-        job = await self.tabs.job_name(guid)
+        job = await settled_job(await self.tabs.job_name(guid), row.get("tty"), self._call)
         while job is not None and not is_shell_job(job) and self.clock() < deadline:
             await self.sleep(0.5)
-            job = await self.tabs.job_name(guid)
+            job = await settled_job(await self.tabs.job_name(guid), row.get("tty"), self._call)
         waited = self.clock() - start
         if job is None:
             log.warning("evict %s: tab is gone; nothing typed", sid)
@@ -728,21 +746,49 @@ class Evictor(object):
             return False
         return True
 
-    def run_on_evict(self, row, title, outcome):
+    def run_on_evict(self, row, title, outcome, eid=None):
+        """Run the on_evict hook; the eviction row's hook_at is stamped once it has run (or
+        when none is configured). An eviction cancelled before this point, or a daemon that
+        died while the hook ran, leaves hook_at empty: sweep_hooks replays it."""
+        def done():
+            ledger.hook_done(self.conn, eid)
         exe = self.cfg.path("on_evict") if self.cfg.get("on_evict") else None
         if not exe:
+            done()
             return None
         env = dict(os.environ, CC_SESSION_ID=row["session_id"], CC_SESSION_CWD=row.get("cwd") or "",
                    CC_SESSION_TITLE=title or "", CC_EVICT_OUTCOME=outcome)
         if self.on_evict is not None:
-            return self.on_evict(exe, env)
+            out = self.on_evict(exe, env)
+            done()
+            return out
         try:
-            return asyncio.ensure_future(_run_hook(exe, env))
+            return asyncio.ensure_future(_run_hook(exe, env, done))
         except RuntimeError:
             return None
 
+    def sweep_hooks(self, now=None):
+        """Replay on_evict for finished evictions that never ran it (a cancelled eviction
+        pass, a daemon that exited mid-hook). Only a session still hibernated gets it; any
+        other is stamped as not needed. -> number replayed."""
+        now = time.time() if now is None else now
+        n = 0
+        for r in ledger.pending_hooks(self.conn, now - HOOK_SWEEP_MIN_AGE_S):
+            eid = r.pop("eviction_id")
+            outcome = r.pop("outcome")
+            if r.get("state") == EVICTING:
+                continue  # reconcile decides first: hibernated gets the hook, alive does not
+            if r.get("state") != HIBERNATED:
+                ledger.hook_done(self.conn, eid, now)
+                continue
+            log.warning("on_evict never ran for %s (eviction %s, %s); running it now",
+                        r["session_id"][:8], eid, outcome)
+            self.run_on_evict(r, r.get("title") or r["session_id"][:8], outcome, eid)
+            n += 1
+        return n
 
-async def _run_hook(exe, env):
+
+async def _run_hook(exe, env, done=None):
     try:
         p = await asyncio.create_subprocess_exec(exe, env=env, stdout=asyncio.subprocess.PIPE,
                                                  stderr=asyncio.subprocess.STDOUT)
@@ -751,10 +797,17 @@ async def _run_hook(exe, env):
         except asyncio.TimeoutError:
             p.kill()
             log.warning("on_evict %s timed out after %ss", exe, ON_EVICT_TIMEOUT_S)
-            return
-        log.info("on_evict %s exit %s: %s", exe, p.returncode, (out or b"").decode("utf-8", "replace").strip()[:300])
+        else:
+            log.info("on_evict %s exit %s: %s", exe, p.returncode,
+                     (out or b"").decode("utf-8", "replace").strip()[:300])
     except Exception as exc:
         log.warning("on_evict %s failed: %s", exe, exc)
+    # not on CancelledError (it propagates past this line): the next daemon replays it
+    if done is not None:
+        try:
+            done()
+        except Exception:
+            log.exception("on_evict: could not stamp the eviction as run")
 
 
 # ------------------------------------------------------------------ pressure loop (pure-ish)
@@ -1290,6 +1343,8 @@ class Daemon(object):
             n = expire_resuming(self.conn, self.cfg, now, probes)
             if n:
                 log.info("%d resuming row(s) timed out", n)
+        if not self.dry_run:
+            self.evictor.sweep_hooks(now)
         focus = await self.snapshot()
         self.stamp_visibility(focus, now)
         if now - self.last_reap > REAP_EVERY_S:
@@ -1423,6 +1478,8 @@ class Daemon(object):
             return "dry-run"
         guid = row.get("iterm_guid")
         job = await self.tabs.job_name(guid) if guid else None
+        if job is not None and not is_shell_job(job):
+            job = await settled_job(job, procs.norm_tty(await self.tabs.tty(guid)), self.off)
         ledger.mark_resuming(self.conn, row["session_id"])
         if job is None:
             await self.tabs.new_tab(cmd + "\r")
@@ -1478,6 +1535,7 @@ class Daemon(object):
         hib.sort(key=lambda r: r.get("evicted_at") or 0, reverse=True)
         row = hib[0]
         job = (await iterm_call(session.async_get_variable("jobName"), "jobName")) or ""
+        job = await settled_job(job, tty, self.off)
         gone = await self.identity(row) == procs.GONE
         why = resume_decision(row, guid, tty, now, self.last_fire, job, lambda r: not gone)
         if why:
