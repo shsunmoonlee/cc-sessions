@@ -49,6 +49,8 @@ READ_COMPATIBLE_FROM = 2
 # an eviction's on_evict hook is started at most this many times, across daemons: the
 # original run plus one replay, or two replays when the original never started
 MAX_HOOK_RUNS = 2
+# a v2 daemon ran the hook up to ~35 s after finish_eviction (measured 10-14: median 12 s)
+HOOK_SETTLE_S = 600
 
 EVENTS_KEEP_S = 30 * 86400
 EVICTIONS_KEEP_S = 90 * 86400
@@ -173,11 +175,21 @@ def migrate_v1_to_v2(conn):
 def migrate_v2_to_v3(conn):
     """v2 -> v3 inside the caller's transaction: evictions.hook_at, stamped when the
     on_evict hook has run for that eviction, and hook_runs, the times it was started.
-    Finished rows that predate it count as run (a v2 daemon ran the hook right after
-    finish_eviction); a 'started' one never reached its hook and stays open for replay."""
+    See count_settled_hooks_as_run for which earlier rows count as run."""
     conn.execute("ALTER TABLE evictions ADD COLUMN hook_at REAL")
     conn.execute("ALTER TABLE evictions ADD COLUMN hook_runs INTEGER DEFAULT 0")
-    conn.execute("UPDATE evictions SET hook_at=ts WHERE outcome <> 'started'")
+    count_settled_hooks_as_run(conn, time.time())
+
+
+def count_settled_hooks_as_run(conn, now):
+    """Mark evictions an older daemon must already have hooked: 'term' or 'killed' (v2 ran
+    the hook only for those, after the tab step) and older than HOOK_SETTLE_S, so a v2
+    daemon killed between finish_eviction and its hook leaves the row open. 'started',
+    'unknown' and 'kill-failed' never got a hook from v2 and stay open. A young finished
+    row may be hooked twice (README: the hook must be safe to run twice). -> rows marked."""
+    return conn.execute("UPDATE evictions SET hook_at=ts WHERE hook_at IS NULL "
+                        "AND outcome IN ('term', 'killed') AND ts < ?",
+                        (now - HOOK_SETTLE_S,)).rowcount
 
 
 @contextlib.contextmanager
@@ -449,15 +461,14 @@ def hook_started(conn, eviction_id):
 
 
 def begin_hook_tracking(conn, now=None):
-    """Once per ledger, the first daemon that stamps hooks: every finished eviction before
-    it counts as run. A pre-v3 daemon still running after the migration wrote its evictions
-    unstamped and did run their hooks; a 'started' one did not. -> rows stamped."""
+    """Once per ledger, the first daemon that stamps hooks: a pre-v3 daemon still running
+    after the migration wrote its evictions unstamped and ran their hooks, so the ones it
+    must have hooked count as run (count_settled_hooks_as_run). -> rows stamped."""
     now = time.time() if now is None else now
     with tx(conn):
         if conn.execute("SELECT 1 FROM meta WHERE key='hooks_tracked_since'").fetchone():
             return 0
-        n = conn.execute("UPDATE evictions SET hook_at=ts WHERE hook_at IS NULL AND ts < ? "
-                         "AND outcome <> 'started'", (now,)).rowcount
+        n = count_settled_hooks_as_run(conn, now)
         conn.execute("INSERT INTO meta(key, value) VALUES ('hooks_tracked_since', ?)", (repr(now),))
         return n
 
@@ -491,6 +502,18 @@ def mark_resuming(conn, sid, now=None):
         if cur.rowcount:
             add_event(conn, sid, "resuming", None, now)
         return cur.rowcount
+
+
+def begin_resume(conn, sid, now=None):
+    """The daemon's focus and wake paths: hibernated -> resuming only. False when another
+    path already took it, so only one of them types the resume command."""
+    now = time.time() if now is None else now
+    with tx(conn):
+        cur = conn.execute("UPDATE sessions SET state=?, state_since=? WHERE session_id=? AND "
+                           "state=?", (RESUMING, now, sid, HIBERNATED))
+        if cur.rowcount:
+            add_event(conn, sid, "resuming", None, now)
+        return cur.rowcount == 1
 
 
 def claim_resume(conn, sid, pid, pid_start, now=None):

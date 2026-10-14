@@ -308,11 +308,15 @@ async def settled_job(job, tty, run, recheck=None):
         return job
     try:
         fg = await run(procs.foreground_job, tty)
-        if recheck is not None and is_shell_job(job) and fg is not None and not is_shell_job(fg):
-            await recheck()
-            fg = await run(procs.foreground_job, tty)
     except Exception:
         return job
+    if recheck is not None and is_shell_job(job) and fg is not None and not is_shell_job(fg):
+        await recheck()
+        try:
+            again = await run(procs.foreground_job, tty)
+        except Exception:
+            again = None
+        fg = again if again is not None else fg  # ps could not tell twice: keep its first answer
     return fg if fg is not None else job
 
 
@@ -555,6 +559,7 @@ class Evictor(object):
         # eviction ids this daemon is still evicting, whose hook is still running, or that
         # it already replayed once: the sweep never touches them (one daemon at a time)
         self.active, self.hooks_running, self.replayed = set(), set(), set()
+        self.unstamped = set()  # hooks that ran but whose stamp failed: retried by the sweep
         self.tracking_checked = False
 
     async def _call(self, fn, *args):
@@ -780,9 +785,10 @@ class Evictor(object):
             try:
                 ledger.hook_done(self.conn, eid)
             except Exception:
-                # it did run: this daemon must not replay it (hook_runs caps the next one)
+                # it did run: never replay it here, retry the stamp on the next sweep
                 if eid is not None:
                     self.replayed.add(eid)
+                    self.unstamped.add(eid)
                 log.exception("on_evict: could not stamp eviction %s as run", eid)
         exe = self.cfg.path("on_evict") if self.cfg.get("on_evict") else None
         if not exe:
@@ -813,6 +819,13 @@ class Evictor(object):
         resuming waits for reconcile / expire_resuming; any other is stamped as not needed.
         Each eviction is replayed at most once per daemon. -> number replayed."""
         now = time.time() if now is None else now
+        for eid in sorted(self.unstamped):
+            try:
+                ledger.hook_done(self.conn, eid, now)
+            except Exception:
+                log.warning("on_evict: stamp of eviction %s still failing", eid)
+                break
+            self.unstamped.discard(eid)
         if not self.tracking_checked:
             n = ledger.begin_hook_tracking(self.conn, now)
             if n:
@@ -848,6 +861,10 @@ async def _run_hook(exe, env, done=None):
             out, _ = await asyncio.wait_for(p.communicate(), ON_EVICT_TIMEOUT_S)
         except asyncio.TimeoutError:
             p.kill()
+            try:
+                await asyncio.wait_for(p.wait(), 5)
+            except asyncio.TimeoutError:
+                pass
             log.warning("on_evict %s timed out after %ss", exe, ON_EVICT_TIMEOUT_S)
         else:
             log.info("on_evict %s exit %s: %s", exe, p.returncode,
@@ -985,6 +1002,17 @@ def startup_reconcile(conn, cfg, now=None, probes=None):
     rows = ledger.all_rows(conn, "state=?", (EVICTING,))
     return reconcile(conn, probes if probes is not None else probe_rows(rows), now,
                      min_age_s=float(cfg["term_grace_s"]) + 60)
+
+
+def startup_ledger(conn, cfg, now=None, probes=None):
+    """main()'s ledger step before any loop runs: reconcile what a previous daemon left
+    evicting (startup_reconcile), and start on_evict tracking, so no eviction this daemon
+    makes can be mistaken for an older one. -> the reconciled rows."""
+    fixed = startup_reconcile(conn, cfg, now, probes)
+    n = ledger.begin_hook_tracking(conn, now)
+    if n:
+        log.info("on_evict tracking starts: %d earlier eviction(s) count as run", n)
+    return fixed
 
 
 def expire_resuming(conn, cfg, now=None, probes=None):
@@ -1547,7 +1575,8 @@ class Daemon(object):
         if job is not None:
             job = await settled_job(job, procs.norm_tty(await self.tabs.tty(guid)), self.off,
                                     self.prompt_recheck)
-        ledger.mark_resuming(self.conn, row["session_id"])
+        if not ledger.begin_resume(self.conn, row["session_id"]):
+            return "already resuming"
         if job is None:
             await self.tabs.new_tab(cmd + "\r")
             return "resumed"
@@ -1614,7 +1643,9 @@ class Daemon(object):
         if self.dry_run:
             log.info("DRY RUN would resume %s on focus", row["session_id"][:8])
             return
-        ledger.mark_resuming(self.conn, row["session_id"], now)
+        if not ledger.begin_resume(self.conn, row["session_id"], now):
+            log.info("focus %s: %s is already resuming", tty, row["session_id"][:8])
+            return
         await iterm_call(session.async_send_text(
             "\x15" + resumecmd.command(self.cfg, row["session_id"], row.get("cwd")) + "\r"), "send_text")
         await iterm_call(session.async_set_name(await self.resume_title(row)), "set_name")
@@ -1850,8 +1881,7 @@ def main(argv=None):
         log.warning("daemon output file was %d bytes; truncated", dropped)
     conn = ledger.connect(cfg.path("db"))
     record_start(conn)
-    fixed = startup_reconcile(conn, cfg)
-    for sid, old, new in fixed:
+    for sid, old, new in startup_ledger(conn, cfg):
         log.info("startup: %s %s -> %s", sid[:8], old, new)
     log.info("daemon start (dry_run=%s, pid %d)", dry_run, os.getpid())
     # Before the first connection attempt no iterm2 library state exists, so waiting here

@@ -3,6 +3,7 @@ kernel's foreground group decides whether a tab is at a shell, not iTerm2's jobN
 import argparse
 import asyncio
 import contextlib
+import inspect
 import io
 import os
 import sqlite3
@@ -307,6 +308,23 @@ class HookInFlight(HookBase):
         self.assertEqual(ev.sweep_hooks(NOW + 10_000), 0)
         self.assertEqual(len(self.hooks), 1)
 
+    def test_a_failed_stamp_is_retried_and_the_next_daemon_does_not_rerun(self):
+        r = self.row("a4")
+        ev = self.evictor(Tabs())
+        with mock.patch.object(ledger, "hook_done", side_effect=sqlite3.OperationalError("locked")):
+            arun(ev.evict(r, 10, 1))
+        self.assertIsNone(hook_at(self.conn, "a4"))
+        self.assertEqual(ev.sweep_hooks(NOW + 10_000), 0)
+        self.assertIsNotNone(hook_at(self.conn, "a4"))
+        self.assertEqual(ev.unstamped, set())
+        self.assertEqual(self.evictor(Tabs()).sweep_hooks(NOW + 20_000), 0)
+        self.assertEqual(len(self.hooks), 1)
+
+    def test_a_previous_daemons_young_eviction_waits(self):
+        self.unstamped("prev", "hibernated", ts=NOW - 150)
+        self.assertEqual(self.evictor(Tabs()).sweep_hooks(NOW), 0)
+        self.assertEqual(self.evictor(Tabs()).sweep_hooks(NOW + D.HOOK_SWEEP_MIN_AGE_S), 1)
+
     def test_no_hook_configured_stamps_without_a_replay(self):
         self.cfg["on_evict"] = None
         self.unstamped("none", "hibernated")
@@ -342,7 +360,7 @@ class StartupReconcile(TempEnv):
     def test_a_young_evicting_row_waits_for_the_tick(self):
         # a claude still exiting after the killed daemon's SIGTERM reads as alive
         now = 10_000.0
-        self.insert(session_id="young", state="evicting", state_since=now - 5, evicted_at=now - 5,
+        self.insert(session_id="young", state="evicting", state_since=now - 60, evicted_at=now - 60,
                     pid=1, pid_start=1)
         self.insert(session_id="old", state="evicting", state_since=now - 3600, evicted_at=now - 3600,
                     pid=2, pid_start=2)
@@ -350,6 +368,95 @@ class StartupReconcile(TempEnv):
         self.assertEqual([f[0] for f in fixed], ["old"])
         self.assertEqual(ledger.state_of(self.conn, "young"), "evicting")
         self.assertIsNotNone(ledger.get(self.conn, "young")["evicted_at"])
+
+
+class StartupLedger(TempEnv):
+    def test_startup_reconciles_and_starts_tracking_before_any_loop(self):
+        now = 10_000.0
+        self.insert(session_id="gone", state="evicting", state_since=now - 3600, pid=1, pid_start=1)
+        with ledger.tx(self.conn):
+            self.conn.execute("INSERT INTO evictions(session_id, ts, outcome) VALUES ('x', ?, 'term')",
+                              (now - 3600,))
+        fixed = D.startup_ledger(self.conn, self.cfg, now, {"gone": "gone"})
+        self.assertEqual(fixed, [("gone", "evicting", "hibernated")])
+        self.assertIsNotNone(ledger.get_meta(self.conn, "hooks_tracked_since"))
+        self.assertEqual(hook_at(self.conn, "x"), now - 3600)
+
+    def test_main_uses_it(self):
+        src = inspect.getsource(D.main)
+        self.assertIn("startup_ledger(conn, cfg)", src)
+        self.assertNotIn("reconcile(conn, probe_rows", src)
+
+
+class SettleWindow(TempEnv):
+    def v2_with(self, rows):
+        path = os.path.join(self.tmp, "v2s.db")
+        c = sqlite3.connect(path)
+        c.executescript(V2_LEDGER)
+        for sid, age, outcome in rows:
+            c.execute("INSERT INTO evictions(session_id, ts, outcome) VALUES (?,?,?)",
+                      (sid, time.time() - age, outcome))
+        c.commit()
+        c.close()
+        return ledger.connect(path)
+
+    def test_only_settled_term_and_killed_rows_count_as_run_at_the_upgrade(self):
+        # v2 ran the hook only for term/killed, up to ~35 s after finish_eviction
+        conn = self.v2_with([("young", 20, "term"), ("oldkill", 7200, "killed"),
+                             ("unk", 7200, "unknown"), ("kf", 7200, "kill-failed"),
+                             ("st", 7200, "started")])
+        self.assertIsNone(hook_at(conn, "young"))
+        self.assertIsNotNone(hook_at(conn, "oldkill"))
+        for sid in ("unk", "kf", "st"):
+            self.assertIsNone(hook_at(conn, sid), sid)
+        self.assertEqual(hook_at(conn, "h1"), 100.0)
+        conn.close()
+
+
+class OneResumeTypes(TempEnv):
+    def daemon(self):
+        d = D.Daemon(self.cfg, self.conn, FakeApp([]), None, False)
+
+        async def ident(r):
+            return D.procs.GONE
+        d.identity = ident
+
+        async def off(fn, *a):
+            return fn(*a)
+        d.off = off
+        return d
+
+    def test_begin_resume_only_from_hibernated(self):
+        self.insert(session_id="r", state="hibernated", pid=1, pid_start=1)
+        self.assertTrue(ledger.begin_resume(self.conn, "r"))
+        self.assertFalse(ledger.begin_resume(self.conn, "r"))
+        self.assertEqual(ledger.state_of(self.conn, "r"), "resuming")
+
+    def test_focus_and_wake_racing_type_the_command_once(self):
+        self.insert(session_id="hib", tty="ttys002", state="hibernated", iterm_guid="G2",
+                    evicted_at=time.time() - 600, pid=222, cwd="/w/x", title="T")
+        d = self.daemon()
+        d.tabs = FakeTabs(["-zsh"], tty="ttys002")
+        stale = ledger.get(self.conn, "hib")  # both paths read the row as hibernated
+        s = FakeSession("G2", "ttys002")
+        arun(d.on_focus(s))
+        self.assertEqual(len(s.sent), 1)
+        self.assertEqual(arun(d.wake(stale)), "already resuming")
+        self.assertFalse([c for c in d.tabs.calls if c[0] == "send"])
+
+    def test_a_wake_landing_while_focus_awaits_stops_focus_typing(self):
+        self.insert(session_id="hib2", tty="ttys003", state="hibernated", iterm_guid="G3",
+                    evicted_at=time.time() - 600, pid=223, cwd="/w/y", title="T2")
+        d = self.daemon()
+        conn = self.conn
+
+        async def ident(r):
+            ledger.begin_resume(conn, "hib2")  # wake took it during this await
+            return D.procs.GONE
+        d.identity = ident
+        s = FakeSession("G3", "ttys003")
+        arun(d.on_focus(s))
+        self.assertEqual(s.sent, [])
 
 
 class HookTrackingStart(TempEnv):
@@ -544,6 +651,38 @@ class SettledJob(TempEnv):
         arun(D.settled_job("-zsh", "ttys001", self.probe, still))
         self.assertEqual(len(rechecks), n)
 
+    def test_a_recheck_that_cannot_tell_keeps_the_first_ps_answer(self):
+        fg = self.foreground
+
+        async def ps_gone():
+            fg.clear()
+        fg["ttys001"] = "vim"
+        self.assertEqual(arun(D.settled_job("-zsh", "ttys001", self.probe, ps_gone)), "vim")
+        calls = []
+
+        async def flaky(fn, *a):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("ps timed out")
+            return fn(*a)
+        fg["ttys001"] = "vim"
+
+        async def nothing():
+            return None
+        self.assertEqual(arun(D.settled_job("-zsh", "ttys001", flaky, nothing)), "vim")
+
+    def test_the_default_recheck_waits_prompt_recheck_s(self):
+        d = D.Daemon(self.cfg, self.conn, FakeApp([]), None, False)
+        self.assertIs(d.prompt_recheck, D._prompt_recheck)
+        waited = []
+
+        async def fake_sleep(t):
+            waited.append(t)
+        with mock.patch.object(D.asyncio, "sleep", fake_sleep):
+            arun(D._prompt_recheck())
+        self.assertEqual(waited, [D.PROMPT_RECHECK_S])
+        self.assertGreater(D.PROMPT_RECHECK_S, 0)
+
     def test_a_failing_probe_keeps_the_job(self):
         async def run(fn, *a):
             raise RuntimeError("ps gone")
@@ -649,6 +788,21 @@ class ForegroundDaemonPaths(TempEnv):
         sent = [c for c in d.tabs.calls if c[0] == "send"]
         self.assertEqual(len(sent), 1)
         self.assertTrue(sent[0][2].startswith("\x15") and sent[0][2].endswith("\r"))
+
+    def test_wake_rechecks_a_prompt_helper_then_resumes(self):
+        self.hib()
+        d = self.daemon()
+        d.tabs = FakeTabs(["-zsh"], tty="ttys002")
+        fg = self.foreground
+        fg["ttys002"] = "direnv"
+        seen = []
+
+        async def recheck():
+            seen.append(1)
+            fg["ttys002"] = "-zsh"
+        d.prompt_recheck = recheck
+        self.assertEqual(arun(d.wake(ledger.get(self.conn, "hib"))), "resumed")
+        self.assertEqual(seen, [1])
 
     def test_wake_refuses_a_stale_shell_name_over_a_running_program(self):
         self.hib()

@@ -81,6 +81,10 @@ Whether a tab is at a shell comes from the tty's foreground process group (`ps`)
 iTerm2's job name only when `ps` cannot tell: the job name lags, naming the exited claude
 after the shell has the terminal back.
 
+Ledger schema v3 only adds two `evictions` columns (`hook_at`, `hook_runs`). Code older than
+v3 refuses a v3 ledger, so a rollback first runs
+`sqlite3 ~/.claude/state/cc-sessions.db 'PRAGMA user_version=2'`.
+
 ## Install
 
 Requirements: macOS, iTerm2 with the Python API enabled (Settings > General > Magic), the
