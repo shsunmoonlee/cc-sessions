@@ -417,7 +417,85 @@ class Fix10Tab(TempEnv):
         self.row = self.insert(session_id="s3", state="idle", last_event_at=NOW - 3600,
                                iterm_guid="G3", pid=113, pid_start=1000, tty="ttys001")
         self.go(t)
-        self.assertEqual(t.calls, ["inject", "name", "send"])
+        self.assertEqual(t.calls, ["name", "inject", "send"])
+
+    def test_tab_not_at_a_shell_is_still_named(self):
+        # iTerm2 kept reporting the dead claude binary (named after its version) or a
+        # lingering MCP child as the job: the tab must still get its [zz] title
+        for job in ("2.1.296", "node"):
+            t = Tabs(job=job)
+            self.row = self.insert(session_id="s-" + job, state="idle", last_event_at=NOW - 3600,
+                                   iterm_guid="G-" + job, pid=120, pid_start=1000, tty="ttys001")
+            self.assertEqual(self.go(t), "term")
+            self.assertEqual(t.calls, ["name"])
+            self.assertEqual(len(self.hooks), 1)
+            self.hooks.clear()
+
+    def test_job_settles_to_a_shell_within_the_wait(self):
+        class Settling(Tabs):
+            def __init__(self):
+                super().__init__()
+                self.seen = 0
+
+            async def job_name(self, guid):
+                self.seen += 1
+                return "2.1.296" if self.seen < 12 else "-zsh"
+        t = Settling()
+        self.assertEqual(self.go(t), "term")
+        self.assertEqual(t.calls, ["name", "inject", "send"])
+
+    def _changes_mid_wait(self, **after):
+        class Late(Tabs):
+            def __init__(self):
+                super().__init__(job="2.1.296")
+                self.seen = 0
+
+            async def job_name(self, guid):
+                self.seen += 1
+                return "2.1.296" if self.seen < 5 else "-zsh"
+
+            async def tty(self, guid):
+                return after.get("tty", "ttys001") if self.seen >= 3 else "ttys001"
+
+            async def is_visible(self, guid):
+                return after.get("visible", False) and self.seen >= 3
+        return Late()
+
+    def test_visible_or_tty_change_during_the_wait_leaves_the_tab_alone(self):
+        for i, change in enumerate(({"visible": True}, {"tty": "ttys009"})):
+            t = self._changes_mid_wait(**change)
+            self.row = self.insert(session_id="m%d" % i, state="idle", last_event_at=NOW - 3600,
+                                   iterm_guid="GM%d" % i, pid=130 + i, pid_start=1000, tty="ttys001")
+            self.assertEqual(self.go(t), "term")
+            self.assertEqual(t.calls, [], change)
+
+    def test_tab_gone_types_nothing(self):
+        class Gone(Tabs):
+            async def job_name(self, guid):
+                return None
+        t = Gone()
+        self.assertEqual(self.go(t), "term")
+        self.assertEqual(t.calls, [])
+
+    def test_resumed_during_the_wait_is_not_renamed(self):
+        conn, sid = self.conn, "r1"
+
+        class Resumed(Tabs):
+            def __init__(self):
+                super().__init__(job="2.1.296")
+                self.seen = 0
+
+            async def job_name(self, guid):
+                self.seen += 1
+                if self.seen == 3:
+                    conn.execute("UPDATE sessions SET state='resuming' WHERE session_id=?", (sid,))
+                    conn.commit()
+                return "2.1.296"
+        t = Resumed()
+        self.row = self.insert(session_id=sid, state="idle", last_event_at=NOW - 3600,
+                               iterm_guid="GR", pid=140, pid_start=1000, tty="ttys001")
+        self.go(t)
+        self.assertEqual(t.calls, [])
 
 
 # ------------------------------------------------------------------ 11, 12, 14, 16
