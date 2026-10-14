@@ -686,6 +686,14 @@ class Evictor(object):
                 break
             await self.sleep(0.5)
             waited += 0.5
+        if job is None:
+            log.warning("evict %s: tab is gone; nothing typed", sid)
+            return False
+        # wake / focus do not take evict_lock: the session may have resumed while we waited
+        st = ledger.state_of(self.conn, row["session_id"])
+        if st != HIBERNATED:
+            log.warning("evict %s: row is %s after the tab wait; tab untouched", sid, st)
+            return False
         # the tab may have been reused or brought forward while we waited
         tty = procs.norm_tty(await self.tabs.tty(guid))
         if tty != row.get("tty"):
@@ -699,7 +707,7 @@ class Evictor(object):
         # tab left unnamed shows "-zsh" instead of the hibernated title. Focus resumes it
         # either way (on_focus clears the line and types the full command).
         await self.tabs.set_name(guid, "[zz] %s" % title)
-        if job is not None and not is_shell_job(job):
+        if not is_shell_job(job):
             log.warning("evict %s: tab is not at a shell after %ss (%s); named, nothing typed",
                         sid, TAB_SHELL_WAIT_S, job)
             return False
