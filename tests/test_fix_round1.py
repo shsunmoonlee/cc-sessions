@@ -417,7 +417,32 @@ class Fix10Tab(TempEnv):
         self.row = self.insert(session_id="s3", state="idle", last_event_at=NOW - 3600,
                                iterm_guid="G3", pid=113, pid_start=1000, tty="ttys001")
         self.go(t)
-        self.assertEqual(t.calls, ["inject", "name", "send"])
+        self.assertEqual(t.calls, ["name", "inject", "send"])
+
+    def test_tab_not_at_a_shell_is_still_named(self):
+        # iTerm2 kept reporting the dead claude binary (named after its version) or a
+        # lingering MCP child as the job: the tab must still get its [zz] title
+        for job in ("2.1.296", "node"):
+            t = Tabs(job=job)
+            self.row = self.insert(session_id="s-" + job, state="idle", last_event_at=NOW - 3600,
+                                   iterm_guid="G-" + job, pid=120, pid_start=1000, tty="ttys001")
+            self.assertEqual(self.go(t), "term")
+            self.assertEqual(t.calls, ["name"])
+            self.assertEqual(len(self.hooks), 1)
+            self.hooks.clear()
+
+    def test_job_settles_to_a_shell_within_the_wait(self):
+        class Settling(Tabs):
+            def __init__(self):
+                super().__init__()
+                self.seen = 0
+
+            async def job_name(self, guid):
+                self.seen += 1
+                return "2.1.296" if self.seen < 12 else "-zsh"
+        t = Settling()
+        self.assertEqual(self.go(t), "term")
+        self.assertEqual(t.calls, ["name", "inject", "send"])
 
 
 # ------------------------------------------------------------------ 11, 12, 14, 16

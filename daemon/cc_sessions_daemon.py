@@ -52,7 +52,7 @@ log = logging.getLogger("cc-sessions")
 
 RESUME_DEBOUNCE_S = 20
 SESSION_END_WAIT_S = 5
-TAB_SHELL_WAIT_S = 5
+TAB_SHELL_WAIT_S = 20
 REQUEST_POLL_S = 5
 REAP_EVERY_S = 3600
 PRUNE_EVERY_S = 3600
@@ -686,21 +686,26 @@ class Evictor(object):
                 break
             await self.sleep(0.5)
             waited += 0.5
-        if job is None or not is_shell_job(job):
-            log.warning("evict %s: tab is not at a shell (%s); nothing typed", sid, job)
-            return False
         # the tab may have been reused or brought forward while we waited
         tty = procs.norm_tty(await self.tabs.tty(guid))
         if tty != row.get("tty"):
-            log.warning("evict %s: tab tty is now %s (was %s); nothing typed", sid, tty, row.get("tty"))
+            log.warning("evict %s: tab tty is now %s (was %s); tab untouched", sid, tty, row.get("tty"))
             return False
         if await self.tabs.is_visible(guid):
-            log.warning("evict %s: tab became visible; nothing typed", sid)
+            log.warning("evict %s: tab became visible; tab untouched", sid)
+            return False
+        # the name goes on whatever the tab is running: iTerm2's jobName lags the dead
+        # process (the claude binary is named after its version; MCP children linger), and a
+        # tab left unnamed shows "-zsh" instead of the hibernated title. Focus resumes it
+        # either way (on_focus clears the line and types the full command).
+        await self.tabs.set_name(guid, "[zz] %s" % title)
+        if job is not None and not is_shell_job(job):
+            log.warning("evict %s: tab is not at a shell after %ss (%s); named, nothing typed",
+                        sid, TAB_SHELL_WAIT_S, job)
             return False
         banner = "%s\r\n\x1b[2m[cc-sessions] %s: hibernated to free memory; transcript intact.\r\n" \
                  "  press Enter to resume here\x1b[0m\r\n" % (TTY_RESET, title)
         await self.tabs.inject(guid, banner.encode("utf-8"))
-        await self.tabs.set_name(guid, "[zz] %s" % title)
         await self.tabs.send_text(guid, resumecmd.command(self.cfg, row["session_id"], row.get("cwd")))
         return True
 
