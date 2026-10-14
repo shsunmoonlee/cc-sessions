@@ -679,20 +679,16 @@ class Evictor(object):
         if not guid:
             log.warning("evict %s: no tab GUID; nothing typed", sid)
             return False
-        job, waited = None, 0.0
-        while waited <= TAB_SHELL_WAIT_S:
-            job = await self.tabs.job_name(guid)
-            if job is None or is_shell_job(job):
-                break
+        # wall-clock bound: each job_name is an iTerm2 round trip that can itself be slow
+        start = self.clock()
+        deadline = start + TAB_SHELL_WAIT_S
+        job = await self.tabs.job_name(guid)
+        while job is not None and not is_shell_job(job) and self.clock() < deadline:
             await self.sleep(0.5)
-            waited += 0.5
+            job = await self.tabs.job_name(guid)
+        waited = self.clock() - start
         if job is None:
             log.warning("evict %s: tab is gone; nothing typed", sid)
-            return False
-        # wake / focus do not take evict_lock: the session may have resumed while we waited
-        st = ledger.state_of(self.conn, row["session_id"])
-        if st != HIBERNATED:
-            log.warning("evict %s: row is %s after the tab wait; tab untouched", sid, st)
             return False
         # the tab may have been reused or brought forward while we waited
         tty = procs.norm_tty(await self.tabs.tty(guid))
@@ -702,19 +698,32 @@ class Evictor(object):
         if await self.tabs.is_visible(guid):
             log.warning("evict %s: tab became visible; tab untouched", sid)
             return False
-        # the name goes on whatever the tab is running: iTerm2's jobName lags the dead
-        # process (the claude binary is named after its version; MCP children linger), and a
-        # tab left unnamed shows "-zsh" instead of the hibernated title. Focus resumes it
-        # either way (on_focus clears the line and types the full command).
+        # wake and focus do not take evict_lock, and every await above yields to them: re-read
+        # the row right before each write to the tab
+        if not self._still_hibernated(row, "before naming"):
+            return False
+        # the name goes on whatever the tab reports: iTerm2's jobName lags the dead process
+        # (the claude binary is named after its version; MCP children linger), and a tab left
+        # unnamed shows "-zsh" instead of the hibernated title. Focus resumes it later, once
+        # jobName reads as a shell (resume_decision refuses any other job).
         await self.tabs.set_name(guid, "[zz] %s" % title)
         if not is_shell_job(job):
-            log.warning("evict %s: tab is not at a shell after %ss (%s); named, nothing typed",
-                        sid, TAB_SHELL_WAIT_S, job)
+            log.warning("evict %s: tab is not at a shell after %.0fs (%s); named, nothing typed",
+                        sid, waited, job)
             return False
         banner = "%s\r\n\x1b[2m[cc-sessions] %s: hibernated to free memory; transcript intact.\r\n" \
                  "  press Enter to resume here\x1b[0m\r\n" % (TTY_RESET, title)
         await self.tabs.inject(guid, banner.encode("utf-8"))
+        if not self._still_hibernated(row, "before typing"):
+            return False
         await self.tabs.send_text(guid, resumecmd.command(self.cfg, row["session_id"], row.get("cwd")))
+        return True
+
+    def _still_hibernated(self, row, when):
+        st = ledger.state_of(self.conn, row["session_id"])
+        if st != HIBERNATED:
+            log.warning("evict %s: row is %s %s; tab left as is", row["session_id"][:8], st, when)
+            return False
         return True
 
     def run_on_evict(self, row, title, outcome):

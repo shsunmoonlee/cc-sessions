@@ -37,7 +37,7 @@ class Clock(object):
 class Tabs(object):
     def __init__(self, job="-zsh", tty="ttys001", visible=False, boom=False):
         self.job, self.tty_now, self.visible_now, self.boom = job, tty, visible, boom
-        self.calls = []
+        self.calls, self.args = [], {}
 
     async def job_name(self, guid):
         if self.boom:
@@ -55,9 +55,11 @@ class Tabs(object):
 
     async def set_name(self, guid, name):
         self.calls.append("name")
+        self.args["name"] = name
 
     async def send_text(self, guid, text):
         self.calls.append("send")
+        self.args["send"] = text
 
 
 class FakeWS(object):
@@ -415,9 +417,12 @@ class Fix10Tab(TempEnv):
         self.assertEqual(t.calls, [])
         t = Tabs()
         self.row = self.insert(session_id="s3", state="idle", last_event_at=NOW - 3600,
-                               iterm_guid="G3", pid=113, pid_start=1000, tty="ttys001")
+                               iterm_guid="G3", pid=113, pid_start=1000, tty="ttys001",
+                               title="Fix the uploader", cwd="/w/s3")
         self.go(t)
         self.assertEqual(t.calls, ["name", "inject", "send"])
+        self.assertEqual(t.args["name"], "[zz] Fix the uploader")
+        self.assertIn("s3 --cwd /w/s3", t.args["send"])
 
     def test_tab_not_at_a_shell_is_still_named(self):
         # iTerm2 kept reporting the dead claude binary (named after its version) or a
@@ -425,11 +430,61 @@ class Fix10Tab(TempEnv):
         for job in ("2.1.296", "node"):
             t = Tabs(job=job)
             self.row = self.insert(session_id="s-" + job, state="idle", last_event_at=NOW - 3600,
-                                   iterm_guid="G-" + job, pid=120, pid_start=1000, tty="ttys001")
+                                   iterm_guid="G-" + job, pid=120, pid_start=1000, tty="ttys001",
+                                   title="Title " + job)
             self.assertEqual(self.go(t), "term")
             self.assertEqual(t.calls, ["name"])
+            self.assertEqual(t.args["name"], "[zz] Title " + job)
             self.assertEqual(len(self.hooks), 1)
             self.hooks.clear()
+
+    def test_wait_is_bounded_by_the_clock_not_the_poll_count(self):
+        clock = self.clock
+
+        class Slow(Tabs):
+            def __init__(self):
+                super().__init__(job="2.1.296")
+                self.polls = 0
+
+            async def job_name(self, guid):
+                self.polls += 1
+                clock.t += 4.5  # each iTerm2 round trip answers just under its timeout
+                return self.job
+        t = Slow()
+        start = clock.t
+        self.go(t)
+        self.assertLessEqual(t.polls, 6)
+        self.assertEqual(t.calls, ["name"])
+        self.assertLess(clock.t - start, D.TAB_SHELL_WAIT_S + 60)
+
+    def _flip_row_in(self, method, sid, guid, pid):
+        conn = self.conn
+
+        class Flip(Tabs):
+            async def tty(self, g):
+                if method == "tty":
+                    conn.execute("UPDATE sessions SET state='resuming' WHERE session_id=?", (sid,))
+                    conn.commit()
+                return self.tty_now
+
+            async def inject(self, g, data):
+                await Tabs.inject(self, g, data)
+                if method == "inject":
+                    conn.execute("UPDATE sessions SET state='resuming' WHERE session_id=?", (sid,))
+                    conn.commit()
+        self.row = self.insert(session_id=sid, state="idle", last_event_at=NOW - 3600,
+                               iterm_guid=guid, pid=pid, pid_start=1000, tty="ttys001")
+        return Flip()
+
+    def test_resume_racing_the_tab_writes_stops_them(self):
+        # wake can resume the session during any await after the wait: the row is re-read
+        # right before the name and right before the typed command
+        t = self._flip_row_in("tty", "w1", "GW1", 150)
+        self.go(t)
+        self.assertEqual(t.calls, [])
+        t = self._flip_row_in("inject", "w2", "GW2", 151)
+        self.go(t)
+        self.assertEqual(t.calls, ["name", "inject"])
 
     def test_job_settles_to_a_shell_within_the_wait(self):
         class Settling(Tabs):
