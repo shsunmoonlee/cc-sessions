@@ -24,6 +24,8 @@ REAL_LOG = os.path.expanduser("~/Library/Logs/cc-sessions.log")
 
 from ccsessions import config, ledger, procs  # noqa: E402
 
+REAL_FOREGROUND_JOB = procs.foreground_job  # TempEnv stubs it; its own test calls this
+
 _quiet = logging.getLogger("cc-sessions")
 _quiet.addHandler(logging.NullHandler())
 _quiet.propagate = False

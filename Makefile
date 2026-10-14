@@ -20,6 +20,8 @@ install: render-plist
 	install -m 644 build/$(PLIST) $(LAUNCHAGENTS)/$(PLIST)
 	@echo "installed. load the daemon with:"
 	@echo "  launchctl bootstrap gui/$$(id -u) $(LAUNCHAGENTS)/$(PLIST)"
+	@echo "or restart a running one (it keeps the old code until then):"
+	@echo "  launchctl kickstart -k gui/$$(id -u)/com.cc-sessions.daemon"
 
 render-plist:
 	mkdir -p build

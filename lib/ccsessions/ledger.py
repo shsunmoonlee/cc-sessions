@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, ts REAL, kind TEXT,
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
+# readers (state, holds, cc-resume) only read sessions columns that v2 already has: they
+# must keep answering on a ledger the running daemon has not migrated yet, or the
+# SessionEnd handoff reads "unknown" for a hibernating session and releases its claims
+READ_COMPATIBLE_FROM = 2
+
 EVENTS_KEEP_S = 30 * 86400
 EVICTIONS_KEEP_S = 90 * 86400
 SESSION_END_HIBERNATE_WINDOW_S = 60
@@ -122,8 +127,9 @@ def connect(path, readonly=False):
     conn.execute("PRAGMA busy_timeout=3000")
     if readonly:
         v = conn.execute("PRAGMA user_version").fetchone()[0]
-        if v != SCHEMA_VERSION:
-            raise LedgerError("schema version %s, expected %s" % (v, SCHEMA_VERSION))
+        if not READ_COMPATIBLE_FROM <= v <= SCHEMA_VERSION:
+            raise LedgerError("schema version %s, expected %s..%s"
+                              % (v, READ_COMPATIBLE_FROM, SCHEMA_VERSION))
         return conn
     if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -413,15 +419,29 @@ def hook_done(conn, eviction_id, now=None):
 
 
 def pending_hooks(conn, older_than):
-    """Finished evictions whose on_evict hook never ran, started before `older_than`
-    (an eviction still preparing its tab is younger). Only each session's newest
-    eviction counts; older unstamped ones are superseded by it."""
+    """Evictions whose on_evict hook never ran, begun before `older_than`, including ones
+    still 'started' (cut off between the signal and the hook). Aborted ones never
+    signalled. Only each session's newest eviction counts: a newer one means it resumed."""
     return [row_dict(r) for r in conn.execute(
         "SELECT e.id AS eviction_id, e.outcome, s.* FROM evictions e "
         "JOIN sessions s ON s.session_id = e.session_id "
-        "WHERE e.hook_at IS NULL AND e.outcome NOT IN ('started', 'aborted') AND e.ts < ? "
+        "WHERE e.hook_at IS NULL AND e.outcome <> 'aborted' AND e.ts < ? "
         "AND e.id = (SELECT MAX(id) FROM evictions WHERE session_id = e.session_id) "
         "ORDER BY e.id", (older_than,))]
+
+
+def begin_hook_tracking(conn, now=None):
+    """Once per ledger, the first daemon that stamps hooks: every eviction before it counts
+    as run. A pre-v3 daemon still running after the migration wrote its evictions unstamped
+    and did run their hooks. -> rows stamped."""
+    now = time.time() if now is None else now
+    with tx(conn):
+        if conn.execute("SELECT 1 FROM meta WHERE key='hooks_tracked_since'").fetchone():
+            return 0
+        n = conn.execute("UPDATE evictions SET hook_at=ts WHERE hook_at IS NULL AND ts < ?",
+                         (now,)).rowcount
+        conn.execute("INSERT INTO meta(key, value) VALUES ('hooks_tracked_since', ?)", (repr(now),))
+        return n
 
 
 def rollback_eviction(conn, sid, prev_state, now=None, prev_since=None):

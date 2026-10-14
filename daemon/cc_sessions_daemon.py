@@ -57,9 +57,9 @@ REQUEST_POLL_S = 5
 REAP_EVERY_S = 3600
 PRUNE_EVERY_S = 3600
 ON_EVICT_TIMEOUT_S = 30
-# an eviction finishes its tab + hook well inside this (term grace 15 + SessionEnd 5 +
-# tab wait 20 + hook 30 + slack); younger unstamped evictions may still be in flight
-HOOK_SWEEP_MIN_AGE_S = 180
+# evictions and hooks of THIS daemon are tracked in memory; the age only covers a hook a
+# previous daemon spawned that may still be running (it is killed after ON_EVICT_TIMEOUT_S)
+HOOK_SWEEP_MIN_AGE_S = 2 * ON_EVICT_TIMEOUT_S
 MAX_ABORTS_PER_PASS = 3
 ITERM_CALL_TIMEOUT_S = 5
 APP_CONNECT_TIMEOUT_S = ITERM_CALL_TIMEOUT_S * 3
@@ -293,18 +293,19 @@ def is_shell_job(job):
 
 
 async def settled_job(job, tty, run):
-    """iTerm2's jobName, corrected by the kernel: after a process exits, jobName can keep
-    naming it (the claude binary is named after its version; MCP `node` children linger)
-    while the shell already holds the terminal. A non-shell jobName is replaced by the
-    tty's foreground group when that is a shell. `run(fn, *args)` runs ps off the loop.
-    Never turns a shell into a non-shell, and keeps jobName when ps cannot tell."""
-    if job is None or is_shell_job(job) or not tty:
+    """What holds the tab's terminal: the tty's foreground process group from ps when ps
+    can tell, else iTerm2's jobName. jobName lags both ways: after claude exits it can keep
+    naming the binary (named after its version) or a lingering MCP `node` child while the
+    shell already has the terminal, and a stale shell name can hide a program that just
+    started. Keystrokes go to the foreground group, so that is what decides. None (the
+    tab is gone) stays None. `run(fn, *args)` runs ps off the loop."""
+    if job is None or not tty:
         return job
     try:
         fg = await run(procs.foreground_job, tty)
     except Exception:
         return job
-    return fg if fg is not None and is_shell_job(fg) else job
+    return fg if fg is not None else job
 
 
 class ConnectionLost(Exception):
@@ -539,6 +540,10 @@ class Evictor(object):
         self.children = children or (lambda r: procs.child_identities(r["pid"]))
         self.child_probe = child_probe or (lambda pid, start: procs.identity_probe(pid, start, want_claude=False))
         self.offload = offload
+        # eviction ids this daemon is still evicting, whose hook is still running, or that
+        # it already replayed once: the sweep never touches them (one daemon at a time)
+        self.active, self.hooks_running, self.replayed = set(), set(), set()
+        self.tracking_checked = False
 
     async def _call(self, fn, *args):
         if self.offload is None:
@@ -558,11 +563,19 @@ class Evictor(object):
         log.info("keep %s: %s (eviction rolled back, no signal sent)", row["session_id"][:8], why)
 
     async def evict(self, row, free, rss_mb, recheck=None, title=None, reason=None):
-        sid, pid = row["session_id"], int(row["pid"])
         eid = ledger.begin_eviction(self.conn, row, free, rss_mb, self.clock())
         if eid is None:
-            log.info("keep %s: row changed since the guards ran (compare-and-set lost)", sid[:8])
+            log.info("keep %s: row changed since the guards ran (compare-and-set lost)",
+                     row["session_id"][:8])
             return "aborted-cas"
+        self.active.add(eid)
+        try:
+            return await self._evict(row, eid, free, rss_mb, recheck, title, reason)
+        finally:
+            self.active.discard(eid)
+
+    async def _evict(self, row, eid, free, rss_mb, recheck, title, reason):
+        sid, pid = row["session_id"], int(row["pid"])
         if recheck is not None:
             try:
                 why = recheck(row)
@@ -751,7 +764,11 @@ class Evictor(object):
         when none is configured). An eviction cancelled before this point, or a daemon that
         died while the hook ran, leaves hook_at empty: sweep_hooks replays it."""
         def done():
-            ledger.hook_done(self.conn, eid)
+            self.hooks_running.discard(eid)
+            try:
+                ledger.hook_done(self.conn, eid)
+            except Exception:
+                log.exception("on_evict: could not stamp eviction %s as run", eid)
         exe = self.cfg.path("on_evict") if self.cfg.get("on_evict") else None
         if not exe:
             done()
@@ -762,27 +779,43 @@ class Evictor(object):
             out = self.on_evict(exe, env)
             done()
             return out
+        if eid is not None:
+            self.hooks_running.add(eid)
         try:
             return asyncio.ensure_future(_run_hook(exe, env, done))
         except RuntimeError:
+            self.hooks_running.discard(eid)
             return None
 
     def sweep_hooks(self, now=None):
-        """Replay on_evict for finished evictions that never ran it (a cancelled eviction
-        pass, a daemon that exited mid-hook). Only a session still hibernated gets it; any
-        other is stamped as not needed. -> number replayed."""
+        """Replay on_evict for evictions that never ran it: a pass cancelled or a daemon
+        that died anywhere between the signal and the hook ('started' rows included), or
+        while the hook ran. Only a session still hibernated gets it; one still evicting or
+        resuming waits for reconcile / expire_resuming; any other is stamped as not needed.
+        Each eviction is replayed at most once per daemon. -> number replayed."""
         now = time.time() if now is None else now
+        if not self.tracking_checked:
+            n = ledger.begin_hook_tracking(self.conn, now)
+            if n:
+                log.info("on_evict tracking starts: %d earlier eviction(s) count as run", n)
+            self.tracking_checked = True
         n = 0
         for r in ledger.pending_hooks(self.conn, now - HOOK_SWEEP_MIN_AGE_S):
             eid = r.pop("eviction_id")
             outcome = r.pop("outcome")
-            if r.get("state") == EVICTING:
-                continue  # reconcile decides first: hibernated gets the hook, alive does not
-            if r.get("state") != HIBERNATED:
+            if eid in self.active or eid in self.hooks_running or eid in self.replayed:
+                continue
+            st = r.get("state")
+            if st in (EVICTING, RESUMING):
+                continue
+            if st != HIBERNATED:
                 ledger.hook_done(self.conn, eid, now)
                 continue
+            if outcome == "started":
+                outcome = "interrupted"
             log.warning("on_evict never ran for %s (eviction %s, %s); running it now",
                         r["session_id"][:8], eid, outcome)
+            self.replayed.add(eid)
             self.run_on_evict(r, r.get("title") or r["session_id"][:8], outcome, eid)
             n += 1
         return n
@@ -1344,7 +1377,10 @@ class Daemon(object):
             if n:
                 log.info("%d resuming row(s) timed out", n)
         if not self.dry_run:
-            self.evictor.sweep_hooks(now)
+            try:
+                self.evictor.sweep_hooks(now)
+            except Exception:
+                log.exception("on_evict sweep failed; retried next tick")
         focus = await self.snapshot()
         self.stamp_visibility(focus, now)
         if now - self.last_reap > REAP_EVERY_S:
@@ -1478,7 +1514,7 @@ class Daemon(object):
             return "dry-run"
         guid = row.get("iterm_guid")
         job = await self.tabs.job_name(guid) if guid else None
-        if job is not None and not is_shell_job(job):
+        if job is not None:
             job = await settled_job(job, procs.norm_tty(await self.tabs.tty(guid)), self.off)
         ledger.mark_resuming(self.conn, row["session_id"])
         if job is None:
