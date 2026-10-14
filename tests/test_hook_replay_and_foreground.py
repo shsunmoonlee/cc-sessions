@@ -134,6 +134,8 @@ class HookReplay(HookBase):
         self.assertEqual(arun(self.evictor(Tabs()).evict(r, 10, 1)), "term")
         self.assertEqual(len(self.hooks), 1)
         self.assertIsNotNone(hook_at(self.conn, "n1"))
+        self.assertEqual(self.conn.execute("SELECT hook_runs FROM evictions WHERE session_id='n1'")
+                         .fetchone()[0], 1)
 
     def test_no_hook_configured_still_stamps(self):
         self.cfg["on_evict"] = None
@@ -237,6 +239,117 @@ class HookReplay(HookBase):
         self.assertEqual(ev.sweep_hooks(NOW), 1)
         self.assertEqual([h["CC_EVICT_OUTCOME"] for h in self.hooks], ["killed"])
         self.assertEqual(ev.sweep_hooks(NOW), 0)
+
+
+class HookInFlight(HookBase):
+    def runs(self, sid):
+        return self.conn.execute("SELECT hook_runs FROM evictions WHERE session_id=? ORDER BY id DESC",
+                                 (sid,)).fetchone()[0]
+
+    def test_a_sweep_during_the_eviction_does_not_replay_it(self):
+        swept = []
+        holder = {}
+
+        class SweepingTabs(Tabs):
+            async def job_name(self, guid):
+                # the eviction is finished (term) and hibernated, its hook not run yet
+                swept.append(holder["ev"].sweep_hooks(NOW + 10_000))
+                return await Tabs.job_name(self, guid)
+        ev = self.evictor(SweepingTabs())
+        holder["ev"] = ev
+        r = self.row("a1")
+        self.assertEqual(arun(ev.evict(r, 10, 1)), "term")
+        self.assertTrue(swept and set(swept) == {0}, swept)
+        self.assertEqual(len(self.hooks), 1)
+        self.assertEqual(self.runs("a1"), 1)
+
+    def test_a_running_hook_is_not_replayed(self):
+        exe = os.path.join(self.tmp, "slow-hook.sh")
+        with open(exe, "w") as f:
+            f.write("#!/bin/sh\nsleep 0.5\n")
+        os.chmod(exe, 0o755)
+        self.cfg["on_evict"] = exe
+        ev = self.evictor(Tabs())
+        ev.on_evict = None  # the real subprocess path
+        r = self.row("a2")
+        seen = {}
+
+        async def go():
+            self.assertEqual(await ev.evict(r, 10, 1), "term")
+            seen["running"] = set(ev.hooks_running)
+            seen["swept"] = ev.sweep_hooks(NOW + 10_000)
+            for _ in range(100):  # the hook sleeps 0.5 s; allow for a loaded machine
+                if not ev.hooks_running:
+                    break
+                await asyncio.sleep(0.05)
+        arun(go())
+        self.assertEqual(len(seen["running"]), 1)
+        self.assertEqual(seen["swept"], 0)
+        self.assertEqual(ev.hooks_running, set())
+        self.assertIsNotNone(hook_at(self.conn, "a2"))
+        self.assertEqual(self.runs("a2"), 1)
+
+    def test_a_hook_is_started_at_most_twice_across_daemons(self):
+        self.unstamped("loop", "hibernated")
+        with mock.patch.object(ledger, "hook_done", side_effect=sqlite3.OperationalError("locked")):
+            for _ in range(4):  # four daemons in a crash loop, none able to stamp
+                self.evictor(Tabs()).sweep_hooks(NOW)
+        self.assertEqual(len(self.hooks), ledger.MAX_HOOK_RUNS)
+        self.assertEqual(self.runs("loop"), ledger.MAX_HOOK_RUNS)
+        self.assertIsNone(hook_at(self.conn, "loop"))
+
+    def test_a_hook_that_ran_but_could_not_stamp_is_not_rerun_by_this_daemon(self):
+        r = self.row("a3")
+        ev = self.evictor(Tabs())
+        with mock.patch.object(ledger, "hook_done", side_effect=sqlite3.OperationalError("locked")):
+            arun(ev.evict(r, 10, 1))
+        self.assertEqual(len(self.hooks), 1)
+        self.assertEqual(ev.sweep_hooks(NOW + 10_000), 0)
+        self.assertEqual(len(self.hooks), 1)
+
+    def test_no_hook_configured_stamps_without_a_replay(self):
+        self.cfg["on_evict"] = None
+        self.unstamped("none", "hibernated")
+        ev = self.evictor(Tabs())
+        self.assertEqual(ev.sweep_hooks(NOW), 0)
+        self.assertEqual(self.hooks, [])
+        self.assertIsNotNone(hook_at(self.conn, "none"))
+
+
+class UpgradeKeepsInterruptedOpen(TempEnv):
+    def test_a_v2_eviction_cut_off_before_its_hook_is_replayed_after_the_upgrade(self):
+        # kickstart -k killed the v2 daemon between SIGTERM and finish_eviction; the dying
+        # claude's SessionEnd hook (new code) migrated the ledger
+        path = os.path.join(self.tmp, "v2.db")
+        c = sqlite3.connect(path)
+        c.executescript(V2_LEDGER + """
+            INSERT INTO sessions(session_id, state, pid, pid_start, tty, title)
+              VALUES ('cut', 'hibernated', 9, 9, 'ttys001', 'Cut');
+            INSERT INTO evictions(session_id, ts, outcome) VALUES ('cut', 1000.0, 'started');""")
+        c.close()
+        conn = ledger.connect(path)
+        self.assertIsNone(hook_at(conn, "cut"))
+        self.assertEqual(hook_at(conn, "h1"), 100.0)
+        self.cfg["on_evict"] = "/bin/true"
+        hooks = []
+        ev = D.Evictor(conn, self.cfg, Tabs(), on_evict=lambda exe, env: hooks.append(env), clock=Clock())
+        self.assertEqual(ev.sweep_hooks(5000.0), 1)  # tracking start leaves 'started' open
+        self.assertEqual((hooks[0]["CC_SESSION_ID"], hooks[0]["CC_EVICT_OUTCOME"]), ("cut", "interrupted"))
+        conn.close()
+
+
+class StartupReconcile(TempEnv):
+    def test_a_young_evicting_row_waits_for_the_tick(self):
+        # a claude still exiting after the killed daemon's SIGTERM reads as alive
+        now = 10_000.0
+        self.insert(session_id="young", state="evicting", state_since=now - 5, evicted_at=now - 5,
+                    pid=1, pid_start=1)
+        self.insert(session_id="old", state="evicting", state_since=now - 3600, evicted_at=now - 3600,
+                    pid=2, pid_start=2)
+        fixed = D.startup_reconcile(self.conn, self.cfg, now, {"young": "alive", "old": "alive"})
+        self.assertEqual([f[0] for f in fixed], ["old"])
+        self.assertEqual(ledger.state_of(self.conn, "young"), "evicting")
+        self.assertIsNotNone(ledger.get(self.conn, "young")["evicted_at"])
 
 
 class HookTrackingStart(TempEnv):
@@ -390,24 +503,46 @@ class ForegroundJobProbe(TempEnv):
 
 
 class SettledJob(TempEnv):
-    async def run(self, fn, *a):
+    async def probe(self, fn, *a):
         return fn(*a)
 
     def test_the_foreground_group_wins_when_ps_can_tell(self):
         self.foreground["ttys001"] = "-zsh"
-        self.assertEqual(arun(D.settled_job("2.1.296", "ttys001", self.run)), "-zsh")
+        self.assertEqual(arun(D.settled_job("2.1.296", "ttys001", self.probe)), "-zsh")
         self.foreground["ttys001"] = "claude"
-        self.assertEqual(arun(D.settled_job("2.1.296", "ttys001", self.run)), "claude")
+        self.assertEqual(arun(D.settled_job("2.1.296", "ttys001", self.probe)), "claude")
         # a stale shell name does not hide a program that just took the terminal
         self.foreground["ttys001"] = "vim"
-        self.assertEqual(arun(D.settled_job("-zsh", "ttys001", self.run)), "vim")
+        self.assertEqual(arun(D.settled_job("-zsh", "ttys001", self.probe)), "vim")
 
     def test_jobname_when_ps_cannot_tell_and_none_stays_none(self):
-        self.assertEqual(arun(D.settled_job("node", "ttys001", self.run)), "node")
-        self.assertEqual(arun(D.settled_job("-zsh", "ttys001", self.run)), "-zsh")
+        self.assertEqual(arun(D.settled_job("node", "ttys001", self.probe)), "node")
+        self.assertEqual(arun(D.settled_job("-zsh", "ttys001", self.probe)), "-zsh")
         self.foreground["ttys001"] = "-zsh"
-        self.assertIsNone(arun(D.settled_job(None, "ttys001", self.run)))
-        self.assertEqual(arun(D.settled_job("node", None, self.run)), "node")
+        self.assertIsNone(arun(D.settled_job(None, "ttys001", self.probe)))
+        self.assertEqual(arun(D.settled_job("node", None, self.probe)), "node")
+
+    def test_a_prompt_helper_gets_one_recheck_before_it_overrules_a_shell(self):
+        fg = self.foreground
+        rechecks = []
+
+        async def recheck():
+            rechecks.append(1)
+            fg["ttys001"] = "-zsh"  # the prompt finished rendering
+        fg["ttys001"] = "starship"
+        self.assertEqual(arun(D.settled_job("-zsh", "ttys001", self.probe, recheck)), "-zsh")
+        self.assertEqual(len(rechecks), 1)
+        fg["ttys001"] = "vim"
+
+        async def still():
+            rechecks.append(1)
+        self.assertEqual(arun(D.settled_job("-zsh", "ttys001", self.probe, still)), "vim")
+        # no recheck when jobName is not a shell, or ps agrees
+        n = len(rechecks)
+        arun(D.settled_job("node", "ttys001", self.probe, still))
+        fg["ttys001"] = "-zsh"
+        arun(D.settled_job("-zsh", "ttys001", self.probe, still))
+        self.assertEqual(len(rechecks), n)
 
     def test_a_failing_probe_keeps_the_job(self):
         async def run(fn, *a):
@@ -459,6 +594,10 @@ class ForegroundDaemonPaths(TempEnv):
         async def off(fn, *a):
             return fn(*a)
         d.off = off
+
+        async def no_wait():
+            return None
+        d.prompt_recheck = no_wait
         return d
 
     def hib(self):
@@ -473,11 +612,31 @@ class ForegroundDaemonPaths(TempEnv):
         self.assertEqual(len(s.sent), 1)
         self.assertEqual(ledger.state_of(self.conn, "hib"), "resuming")
 
+    def test_focus_rechecks_a_prompt_helper_then_resumes(self):
+        self.hib()
+        d = self.daemon()
+        fg = self.foreground
+        fg["ttys002"] = "direnv"
+
+        async def recheck():
+            fg["ttys002"] = "-zsh"
+        d.prompt_recheck = recheck
+        s = FakeSession("G2", "ttys002", job="-zsh")
+        arun(d.on_focus(s))
+        self.assertEqual(len(s.sent), 1)
+
     def test_focus_refuses_when_the_foreground_is_not_a_shell(self):
         self.hib()
         self.foreground["ttys002"] = "vim"
         s = FakeSession("G2", "ttys002", job="-zsh")
-        arun(self.daemon().on_focus(s))
+        d = self.daemon()
+        seen = []
+
+        async def recheck():
+            seen.append(1)
+        d.prompt_recheck = recheck
+        arun(d.on_focus(s))
+        self.assertEqual(seen, [1])
         self.assertEqual(s.sent, [])
         self.assertEqual(ledger.state_of(self.conn, "hib"), "hibernated")
 

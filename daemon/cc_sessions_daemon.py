@@ -57,9 +57,12 @@ REQUEST_POLL_S = 5
 REAP_EVERY_S = 3600
 PRUNE_EVERY_S = 3600
 ON_EVICT_TIMEOUT_S = 30
-# evictions and hooks of THIS daemon are tracked in memory; the age only covers a hook a
-# previous daemon spawned that may still be running (it is killed after ON_EVICT_TIMEOUT_S)
-HOOK_SWEEP_MIN_AGE_S = 2 * ON_EVICT_TIMEOUT_S
+PROMPT_RECHECK_S = 0.3
+# Evictions and hooks of THIS daemon are tracked in memory. The age covers a previous
+# daemon's hook that may still run, which only happens outside launchd (launchd kills the
+# old daemon's process group, hooks included). It counts from the eviction's start, which
+# precedes the hook by recheck + term grace + SessionEnd wait + the tab wait.
+HOOK_SWEEP_MIN_AGE_S = 180
 MAX_ABORTS_PER_PASS = 3
 ITERM_CALL_TIMEOUT_S = 5
 APP_CONNECT_TIMEOUT_S = ITERM_CALL_TIMEOUT_S * 3
@@ -292,20 +295,29 @@ def is_shell_job(job):
     return job in procs.SHELL_JOBS
 
 
-async def settled_job(job, tty, run):
+async def settled_job(job, tty, run, recheck=None):
     """What holds the tab's terminal: the tty's foreground process group from ps when ps
     can tell, else iTerm2's jobName. jobName lags both ways: after claude exits it can keep
     naming the binary (named after its version) or a lingering MCP `node` child while the
     shell already has the terminal, and a stale shell name can hide a program that just
     started. Keystrokes go to the foreground group, so that is what decides. None (the
-    tab is gone) stays None. `run(fn, *args)` runs ps off the loop."""
+    tab is gone) stays None. `run(fn, *args)` runs ps off the loop. `recheck()`, when
+    given, is awaited once before ps overrules a shell jobName: a prompt helper ($(...)
+    in a prompt, direnv) holds the shell's foreground group for a moment."""
     if job is None or not tty:
         return job
     try:
         fg = await run(procs.foreground_job, tty)
+        if recheck is not None and is_shell_job(job) and fg is not None and not is_shell_job(fg):
+            await recheck()
+            fg = await run(procs.foreground_job, tty)
     except Exception:
         return job
     return fg if fg is not None else job
+
+
+async def _prompt_recheck():
+    await asyncio.sleep(PROMPT_RECHECK_S)
 
 
 class ConnectionLost(Exception):
@@ -768,11 +780,18 @@ class Evictor(object):
             try:
                 ledger.hook_done(self.conn, eid)
             except Exception:
+                # it did run: this daemon must not replay it (hook_runs caps the next one)
+                if eid is not None:
+                    self.replayed.add(eid)
                 log.exception("on_evict: could not stamp eviction %s as run", eid)
         exe = self.cfg.path("on_evict") if self.cfg.get("on_evict") else None
         if not exe:
             done()
             return None
+        try:
+            ledger.hook_started(self.conn, eid)
+        except Exception:
+            log.exception("on_evict: could not count a start of eviction %s's hook", eid)
         env = dict(os.environ, CC_SESSION_ID=row["session_id"], CC_SESSION_CWD=row.get("cwd") or "",
                    CC_SESSION_TITLE=title or "", CC_EVICT_OUTCOME=outcome)
         if self.on_evict is not None:
@@ -808,7 +827,7 @@ class Evictor(object):
             st = r.get("state")
             if st in (EVICTING, RESUMING):
                 continue
-            if st != HIBERNATED:
+            if st != HIBERNATED or not self.cfg.get("on_evict"):
                 ledger.hook_done(self.conn, eid, now)
                 continue
             if outcome == "started":
@@ -956,6 +975,16 @@ def reconcile(conn, probes, now=None, min_age_s=0.0):
                              "session_id=? AND state=?", (HIBERNATED, now, r["session_id"], r["state"]))
         fixed.append((r["session_id"], r["state"], ledger.state_of(conn, r["session_id"])))
     return fixed
+
+
+def startup_reconcile(conn, cfg, now=None, probes=None):
+    """reconcile() at daemon start, with the same age floor as the tick: a row a killed
+    daemon left evicting moments ago may hold a claude that is still exiting after SIGTERM.
+    Read as alive, it would become idle with evicted_at cleared, and its SessionEnd would
+    then count as a real exit (claims released, no hook). The tick settles young rows."""
+    rows = ledger.all_rows(conn, "state=?", (EVICTING,))
+    return reconcile(conn, probes if probes is not None else probe_rows(rows), now,
+                     min_age_s=float(cfg["term_grace_s"]) + 60)
 
 
 def expire_resuming(conn, cfg, now=None, probes=None):
@@ -1150,6 +1179,7 @@ class Daemon(object):
         self.dry_run = dry_run
         self.tabs = ItermTabs(app, connection)
         self.evictor = Evictor(conn, cfg, self.tabs, offload=self.off)
+        self.prompt_recheck = _prompt_recheck
         self.pressure = Pressure(cfg, lambda: self.off(procs.free_pct),
                                  swap_fn=lambda: self.off(procs.swap_pct))
         self.evict_lock = asyncio.Lock()
@@ -1515,7 +1545,8 @@ class Daemon(object):
         guid = row.get("iterm_guid")
         job = await self.tabs.job_name(guid) if guid else None
         if job is not None:
-            job = await settled_job(job, procs.norm_tty(await self.tabs.tty(guid)), self.off)
+            job = await settled_job(job, procs.norm_tty(await self.tabs.tty(guid)), self.off,
+                                    self.prompt_recheck)
         ledger.mark_resuming(self.conn, row["session_id"])
         if job is None:
             await self.tabs.new_tab(cmd + "\r")
@@ -1571,7 +1602,7 @@ class Daemon(object):
         hib.sort(key=lambda r: r.get("evicted_at") or 0, reverse=True)
         row = hib[0]
         job = (await iterm_call(session.async_get_variable("jobName"), "jobName")) or ""
-        job = await settled_job(job, tty, self.off)
+        job = await settled_job(job, tty, self.off, self.prompt_recheck)
         gone = await self.identity(row) == procs.GONE
         why = resume_decision(row, guid, tty, now, self.last_fire, job, lambda r: not gone)
         if why:
@@ -1819,7 +1850,7 @@ def main(argv=None):
         log.warning("daemon output file was %d bytes; truncated", dropped)
     conn = ledger.connect(cfg.path("db"))
     record_start(conn)
-    fixed = reconcile(conn, probe_rows(ledger.all_rows(conn, "state=?", (EVICTING,))))
+    fixed = startup_reconcile(conn, cfg)
     for sid, old, new in fixed:
         log.info("startup: %s %s -> %s", sid[:8], old, new)
     log.info("daemon start (dry_run=%s, pid %d)", dry_run, os.getpid())

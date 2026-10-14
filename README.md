@@ -177,7 +177,7 @@ path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file tha
 | `stale_busy_min` | 30 | busy this long + Esc-interrupted transcript = idle |
 | `helper_patterns` | `["mcp", "npm exec ", "/.bin/", "-mcp"]` | child processes that are not work (hook runners always are not; a shell-snapshot shell always is) |
 | `cron_recurring_block_h` | 24 | hours a non-durable recurring cron job keeps its session |
-| `on_evict` | null | executable run after an eviction with `CC_SESSION_ID`, `CC_SESSION_CWD`, `CC_SESSION_TITLE`, `CC_EVICT_OUTCOME`; `CC_EVICT_OUTCOME` is `term`, `killed`, or for a replay `unknown`, `kill-failed` or `interrupted`. An eviction whose hook never ran (the daemon stopped anywhere between the signal and the hook) gets it on a later tick once the session is settled as hibernated, at most once per daemon, so the hook must be safe to run twice |
+| `on_evict` | null | executable run after an eviction with `CC_SESSION_ID`, `CC_SESSION_CWD`, `CC_SESSION_TITLE`, `CC_EVICT_OUTCOME`; `CC_EVICT_OUTCOME` is `term`, `killed`, or for a replay `unknown`, `kill-failed` or `interrupted`. An eviction whose hook never ran (the daemon stopped anywhere between the signal and the hook) gets it on a later tick once the session is settled as hibernated. A hook is started at most twice per eviction, across daemon restarts, so it must be safe to run twice |
 | `daemon_python` | `~/.claude/venvs/iterm2/bin/python` | python with `iterm2` |
 | `resume_command` | installed `cc-resume` | what gets typed into tabs |
 | `worktree_marker` | `/.claude/worktrees/` | worktree folder marker (cc-resume) |

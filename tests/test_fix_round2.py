@@ -214,6 +214,8 @@ class Item3Migration(TempEnv):
         self.assertEqual(cols["pid_start"], "INTEGER")
         self.assertIn("held_state", cols)
         self.assertIn("restored_at", cols)
+        ecols = {r[1] for r in conn.execute("PRAGMA table_info(evictions)")}
+        self.assertTrue({"hook_at", "hook_runs"} <= ecols, ecols)
         got = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT session_id, pid_start, typeof(pid_start) FROM sessions")}
         self.assertEqual(got, {"text": (None, "null"), "num": (1790596816, "integer"), "none": (None, "null")})
         self.assertEqual(ledger.get(conn, "num")["state"], "hibernated")

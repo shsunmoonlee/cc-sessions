@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts REAL, session_id TE
   event TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS evictions(id INTEGER PRIMARY KEY, session_id TEXT, ts REAL,
-  pid INTEGER, free_pct REAL, rss_mb REAL, signal TEXT, outcome TEXT, detail TEXT, hook_at REAL);
+  pid INTEGER, free_pct REAL, rss_mb REAL, signal TEXT, outcome TEXT, detail TEXT, hook_at REAL,
+  hook_runs INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, ts REAL, kind TEXT,
   session_id TEXT, done_at REAL, result TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -44,6 +45,10 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 # must keep answering on a ledger the running daemon has not migrated yet, or the
 # SessionEnd handoff reads "unknown" for a hibernating session and releases its claims
 READ_COMPATIBLE_FROM = 2
+
+# an eviction's on_evict hook is started at most this many times, across daemons: the
+# original run plus one replay, or two replays when the original never started
+MAX_HOOK_RUNS = 2
 
 EVENTS_KEEP_S = 30 * 86400
 EVICTIONS_KEEP_S = 90 * 86400
@@ -167,10 +172,12 @@ def migrate_v1_to_v2(conn):
 
 def migrate_v2_to_v3(conn):
     """v2 -> v3 inside the caller's transaction: evictions.hook_at, stamped when the
-    on_evict hook has run for that eviction. Rows that predate it count as run, so the
-    first v3 daemon replays nothing."""
+    on_evict hook has run for that eviction, and hook_runs, the times it was started.
+    Finished rows that predate it count as run (a v2 daemon ran the hook right after
+    finish_eviction); a 'started' one never reached its hook and stays open for replay."""
     conn.execute("ALTER TABLE evictions ADD COLUMN hook_at REAL")
-    conn.execute("UPDATE evictions SET hook_at=ts")
+    conn.execute("ALTER TABLE evictions ADD COLUMN hook_runs INTEGER DEFAULT 0")
+    conn.execute("UPDATE evictions SET hook_at=ts WHERE outcome <> 'started'")
 
 
 @contextlib.contextmanager
@@ -418,28 +425,39 @@ def hook_done(conn, eviction_id, now=None):
                      (now, eviction_id))
 
 
-def pending_hooks(conn, older_than):
-    """Evictions whose on_evict hook never ran, begun before `older_than`, including ones
-    still 'started' (cut off between the signal and the hook). Aborted ones never
-    signalled. Only each session's newest eviction counts: a newer one means it resumed."""
+def pending_hooks(conn, older_than, max_runs=MAX_HOOK_RUNS):
+    """Evictions whose on_evict hook never finished, begun before `older_than`, started
+    fewer than `max_runs` times, including ones still 'started' (cut off between the
+    signal and the hook). Aborted ones never signalled. Only each session's newest
+    eviction counts: a newer one means it resumed."""
     return [row_dict(r) for r in conn.execute(
         "SELECT e.id AS eviction_id, e.outcome, s.* FROM evictions e "
         "JOIN sessions s ON s.session_id = e.session_id "
         "WHERE e.hook_at IS NULL AND e.outcome <> 'aborted' AND e.ts < ? "
+        "AND COALESCE(e.hook_runs, 0) < ? "
         "AND e.id = (SELECT MAX(id) FROM evictions WHERE session_id = e.session_id) "
-        "ORDER BY e.id", (older_than,))]
+        "ORDER BY e.id", (older_than, max_runs))]
+
+
+def hook_started(conn, eviction_id):
+    """Count a start of the eviction's on_evict hook (the cap survives daemon restarts)."""
+    if eviction_id is None:
+        return
+    with tx(conn):
+        conn.execute("UPDATE evictions SET hook_runs=COALESCE(hook_runs, 0)+1 WHERE id=?",
+                     (eviction_id,))
 
 
 def begin_hook_tracking(conn, now=None):
-    """Once per ledger, the first daemon that stamps hooks: every eviction before it counts
-    as run. A pre-v3 daemon still running after the migration wrote its evictions unstamped
-    and did run their hooks. -> rows stamped."""
+    """Once per ledger, the first daemon that stamps hooks: every finished eviction before
+    it counts as run. A pre-v3 daemon still running after the migration wrote its evictions
+    unstamped and did run their hooks; a 'started' one did not. -> rows stamped."""
     now = time.time() if now is None else now
     with tx(conn):
         if conn.execute("SELECT 1 FROM meta WHERE key='hooks_tracked_since'").fetchone():
             return 0
-        n = conn.execute("UPDATE evictions SET hook_at=ts WHERE hook_at IS NULL AND ts < ?",
-                         (now,)).rowcount
+        n = conn.execute("UPDATE evictions SET hook_at=ts WHERE hook_at IS NULL AND ts < ? "
+                         "AND outcome <> 'started'", (now,)).rowcount
         conn.execute("INSERT INTO meta(key, value) VALUES ('hooks_tracked_since', ?)", (repr(now),))
         return n
 
