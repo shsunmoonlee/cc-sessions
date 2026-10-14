@@ -37,11 +37,14 @@ class Clock(object):
 class Tabs(object):
     def __init__(self, job="-zsh", tty="ttys001", visible=False, boom=False):
         self.job, self.tty_now, self.visible_now, self.boom = job, tty, visible, boom
-        self.calls, self.args = [], {}
+        self.calls, self.args, self.job_polls = [], {}, 0
 
     async def job_name(self, guid):
         if self.boom:
             raise RuntimeError("iTerm2 went away")
+        self.job_polls += 1
+        if self.job_polls > 200:  # a wait loop that stopped sleeping or lost its deadline
+            raise AssertionError("prepare_tab polled jobName more than 200 times")
         return self.job
 
     async def tty(self, guid):
@@ -452,10 +455,16 @@ class Fix10Tab(TempEnv):
                 return self.job
         t = Slow()
         start = clock.t
-        self.go(t)
+        with self.assertLogs(D.log, "WARNING") as logs:
+            self.go(t)
         self.assertLessEqual(t.polls, 6)
         self.assertEqual(t.calls, ["name"])
-        self.assertLess(clock.t - start, D.TAB_SHELL_WAIT_S + 60)
+        # the deadline, at most one sleep plus one round trip past it, and the SessionEnd
+        # grace that nothing flips in this test
+        self.assertLessEqual(clock.t - start,
+                             D.TAB_SHELL_WAIT_S + 0.5 + 4.5 + D.SESSION_END_WAIT_S)
+        # polls end at 4.5, 9.5, 14.5, 19.5, 24.5 s: the log reports the measured 24 s
+        self.assertTrue(any("not at a shell after 24s" in m for m in logs.output), logs.output)
 
     def _flip_row_in(self, method, sid, guid, pid):
         conn = self.conn
@@ -466,6 +475,12 @@ class Fix10Tab(TempEnv):
                     conn.execute("UPDATE sessions SET state='resuming' WHERE session_id=?", (sid,))
                     conn.commit()
                 return self.tty_now
+
+            async def set_name(self, g, name):
+                await Tabs.set_name(self, g, name)
+                if method == "name":
+                    conn.execute("UPDATE sessions SET state='resuming' WHERE session_id=?", (sid,))
+                    conn.commit()
 
             async def inject(self, g, data):
                 await Tabs.inject(self, g, data)
@@ -482,6 +497,9 @@ class Fix10Tab(TempEnv):
         t = self._flip_row_in("tty", "w1", "GW1", 150)
         self.go(t)
         self.assertEqual(t.calls, [])
+        t = self._flip_row_in("name", "w3", "GW3", 152)
+        self.go(t)
+        self.assertEqual(t.calls, ["name"])
         t = self._flip_row_in("inject", "w2", "GW2", 151)
         self.go(t)
         self.assertEqual(t.calls, ["name", "inject"])

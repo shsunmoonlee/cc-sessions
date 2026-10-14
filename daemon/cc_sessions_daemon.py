@@ -698,8 +698,8 @@ class Evictor(object):
         if await self.tabs.is_visible(guid):
             log.warning("evict %s: tab became visible; tab untouched", sid)
             return False
-        # wake and focus do not take evict_lock, and every await above yields to them: re-read
-        # the row right before each write to the tab
+        # wake and focus do not take evict_lock, and every await yields to them: re-read the
+        # row right before each write to the tab
         if not self._still_hibernated(row, "before naming"):
             return False
         # the name goes on whatever the tab reports: iTerm2's jobName lags the dead process
@@ -713,6 +713,8 @@ class Evictor(object):
             return False
         banner = "%s\r\n\x1b[2m[cc-sessions] %s: hibernated to free memory; transcript intact.\r\n" \
                  "  press Enter to resume here\x1b[0m\r\n" % (TTY_RESET, title)
+        if not self._still_hibernated(row, "before the banner"):
+            return False
         await self.tabs.inject(guid, banner.encode("utf-8"))
         if not self._still_hibernated(row, "before typing"):
             return False
