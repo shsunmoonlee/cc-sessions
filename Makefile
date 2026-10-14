@@ -15,11 +15,15 @@ PLIST      = com.cc-sessions.daemon.plist
 install: render-plist
 	mkdir -p $(PREFIX)/bin $(LIBDIR)/ccsessions $(LAUNCHAGENTS)
 	for f in $(BIN_FILES); do install -m 755 bin/$$f $(PREFIX)/bin/$$f; done
-	for f in $(LIB_FILES); do install -m 644 lib/ccsessions/$$f $(LIBDIR)/ccsessions/$$f; done
+	@# __init__.py (SCHEMA_VERSION) last: a hook that runs mid-install must never see the new
+	@# schema version with the old ledger code (it would answer "unknown" and release claims)
+	for f in $(filter-out __init__.py,$(LIB_FILES)) __init__.py; do install -m 644 lib/ccsessions/$$f $(LIBDIR)/ccsessions/$$f; done
 	install -m 644 daemon/cc_sessions_daemon.py $(LIBDIR)/cc_sessions_daemon.py
 	install -m 644 build/$(PLIST) $(LAUNCHAGENTS)/$(PLIST)
 	@echo "installed. load the daemon with:"
 	@echo "  launchctl bootstrap gui/$$(id -u) $(LAUNCHAGENTS)/$(PLIST)"
+	@echo "or restart a running one (it keeps the old code until then):"
+	@echo "  launchctl kickstart -k gui/$$(id -u)/com.cc-sessions.daemon"
 
 render-plist:
 	mkdir -p build
@@ -43,6 +47,8 @@ check: render-plist
 
 test:
 	$(PYTHON) -m unittest discover -s tests
+	@# the daemon runs on its own python: run the suite there too when it exists
+	@if [ -x "$(DAEMON_PYTHON)" ]; then echo "--- $(DAEMON_PYTHON)"; $(DAEMON_PYTHON) -m unittest discover -s tests; fi
 
 # fails when the tree contains any string listed (one per line) in the file named by
 # $CC_SESSIONS_PRIVATE_STRINGS; skipped when the variable is unset. LICENSE is exempt (it

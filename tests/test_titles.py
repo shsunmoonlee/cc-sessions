@@ -192,6 +192,9 @@ class FakeTabs(object):
     async def job_name(self, guid):
         return "-zsh"
 
+    async def tty(self, guid):
+        return None
+
     async def send_text(self, guid, text):
         self.calls.append(("send", guid, text))
 

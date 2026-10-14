@@ -8,7 +8,7 @@ daemon (daemon/cc_sessions_daemon.py) imports this package from a python that ha
 
 __version__ = "2.0.0"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Session states written to the ledger.
 BUSY = "busy"

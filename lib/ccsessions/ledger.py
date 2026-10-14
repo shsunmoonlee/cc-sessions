@@ -34,11 +34,23 @@ CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts REAL, session_id TE
   event TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS evictions(id INTEGER PRIMARY KEY, session_id TEXT, ts REAL,
-  pid INTEGER, free_pct REAL, rss_mb REAL, signal TEXT, outcome TEXT, detail TEXT);
+  pid INTEGER, free_pct REAL, rss_mb REAL, signal TEXT, outcome TEXT, detail TEXT, hook_at REAL,
+  hook_runs INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, ts REAL, kind TEXT,
   session_id TEXT, done_at REAL, result TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
+
+# readers (state, holds, cc-resume) only read sessions columns that v2 already has: they
+# must keep answering on a ledger the running daemon has not migrated yet, or the
+# SessionEnd handoff reads "unknown" for a hibernating session and releases its claims
+READ_COMPATIBLE_FROM = 2
+
+# an eviction's on_evict hook is started at most this many times, across daemons: the
+# original run plus one replay, or two replays when the original never started
+MAX_HOOK_RUNS = 2
+# a v2 daemon ran the hook up to ~35 s after finish_eviction (measured 10-14: median 12 s)
+HOOK_SETTLE_S = 600
 
 EVENTS_KEEP_S = 30 * 86400
 EVICTIONS_KEEP_S = 90 * 86400
@@ -122,8 +134,9 @@ def connect(path, readonly=False):
     conn.execute("PRAGMA busy_timeout=3000")
     if readonly:
         v = conn.execute("PRAGMA user_version").fetchone()[0]
-        if v != SCHEMA_VERSION:
-            raise LedgerError("schema version %s, expected %s" % (v, SCHEMA_VERSION))
+        if not READ_COMPATIBLE_FROM <= v <= SCHEMA_VERSION:
+            raise LedgerError("schema version %s, expected %s..%s"
+                              % (v, READ_COMPATIBLE_FROM, SCHEMA_VERSION))
         return conn
     if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -133,8 +146,10 @@ def connect(path, readonly=False):
                 for stmt in SCHEMA.strip().split(";"):
                     if stmt.strip():
                         conn.execute(stmt)
-            elif v == 1:
-                migrate_v1_to_v2(conn)
+            elif v in (1, 2):
+                if v == 1:
+                    migrate_v1_to_v2(conn)
+                migrate_v2_to_v3(conn)
             elif v != SCHEMA_VERSION:
                 raise LedgerError("ledger schema %s is newer than this code (%s)" % (v, SCHEMA_VERSION))
             conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
@@ -155,6 +170,26 @@ def migrate_v1_to_v2(conn):
                  % (V1_COLUMNS, V1_COLUMNS))
     conn.execute("DROP TABLE sessions_v1")
     conn.execute(SESSIONS_INDEX)
+
+
+def migrate_v2_to_v3(conn):
+    """v2 -> v3 inside the caller's transaction: evictions.hook_at, stamped when the
+    on_evict hook has run for that eviction, and hook_runs, the times it was started.
+    See count_settled_hooks_as_run for which earlier rows count as run."""
+    conn.execute("ALTER TABLE evictions ADD COLUMN hook_at REAL")
+    conn.execute("ALTER TABLE evictions ADD COLUMN hook_runs INTEGER DEFAULT 0")
+    count_settled_hooks_as_run(conn, time.time())
+
+
+def count_settled_hooks_as_run(conn, now):
+    """Mark evictions an older daemon must already have hooked: 'term' or 'killed' (v2 ran
+    the hook only for those, after the tab step) and older than HOOK_SETTLE_S, so a v2
+    daemon killed between finish_eviction and its hook leaves the row open. 'started',
+    'unknown' and 'kill-failed' never got a hook from v2 and stay open. A young finished
+    row may be hooked twice (README: the hook must be safe to run twice). -> rows marked."""
+    return conn.execute("UPDATE evictions SET hook_at=ts WHERE hook_at IS NULL "
+                        "AND outcome IN ('term', 'killed') AND ts < ?",
+                        (now - HOOK_SETTLE_S,)).rowcount
 
 
 @contextlib.contextmanager
@@ -392,6 +427,52 @@ def finish_eviction(conn, eviction_id, outcome, signal=None, detail=None):
                          (outcome, detail, eviction_id))
 
 
+def hook_done(conn, eviction_id, now=None):
+    """Stamp an eviction's on_evict hook as run (or as not needed)."""
+    if eviction_id is None:
+        return
+    now = time.time() if now is None else now
+    with tx(conn):
+        conn.execute("UPDATE evictions SET hook_at=? WHERE id=? AND hook_at IS NULL",
+                     (now, eviction_id))
+
+
+def pending_hooks(conn, older_than, max_runs=MAX_HOOK_RUNS):
+    """Evictions whose on_evict hook never finished, begun before `older_than`, started
+    fewer than `max_runs` times, including ones still 'started' (cut off between the
+    signal and the hook). Aborted ones never signalled. Only each session's newest
+    eviction counts: a newer one means it resumed."""
+    return [row_dict(r) for r in conn.execute(
+        "SELECT e.id AS eviction_id, e.outcome, s.* FROM evictions e "
+        "JOIN sessions s ON s.session_id = e.session_id "
+        "WHERE e.hook_at IS NULL AND e.outcome <> 'aborted' AND e.ts < ? "
+        "AND COALESCE(e.hook_runs, 0) < ? "
+        "AND e.id = (SELECT MAX(id) FROM evictions WHERE session_id = e.session_id) "
+        "ORDER BY e.id", (older_than, max_runs))]
+
+
+def hook_started(conn, eviction_id):
+    """Count a start of the eviction's on_evict hook (the cap survives daemon restarts)."""
+    if eviction_id is None:
+        return
+    with tx(conn):
+        conn.execute("UPDATE evictions SET hook_runs=COALESCE(hook_runs, 0)+1 WHERE id=?",
+                     (eviction_id,))
+
+
+def begin_hook_tracking(conn, now=None):
+    """Once per ledger, the first daemon that stamps hooks: a pre-v3 daemon still running
+    after the migration wrote its evictions unstamped and ran their hooks, so the ones it
+    must have hooked count as run (count_settled_hooks_as_run). -> rows stamped."""
+    now = time.time() if now is None else now
+    with tx(conn):
+        if conn.execute("SELECT 1 FROM meta WHERE key='hooks_tracked_since'").fetchone():
+            return 0
+        n = count_settled_hooks_as_run(conn, now)
+        conn.execute("INSERT INTO meta(key, value) VALUES ('hooks_tracked_since', ?)", (repr(now),))
+        return n
+
+
 def rollback_eviction(conn, sid, prev_state, now=None, prev_since=None):
     """Undo an evicting flip when no signal was sent. A state a hook recorded meanwhile
     (held_state) wins over the state the guards saw."""
@@ -421,6 +502,18 @@ def mark_resuming(conn, sid, now=None):
         if cur.rowcount:
             add_event(conn, sid, "resuming", None, now)
         return cur.rowcount
+
+
+def begin_resume(conn, sid, now=None):
+    """The daemon's focus and wake paths: hibernated -> resuming only. False when another
+    path already took it, so only one of them types the resume command."""
+    now = time.time() if now is None else now
+    with tx(conn):
+        cur = conn.execute("UPDATE sessions SET state=?, state_since=? WHERE session_id=? AND "
+                           "state=?", (RESUMING, now, sid, HIBERNATED))
+        if cur.rowcount:
+            add_event(conn, sid, "resuming", None, now)
+        return cur.rowcount == 1
 
 
 def claim_resume(conn, sid, pid, pid_start, now=None):

@@ -52,6 +52,40 @@ def norm_tty(tty):
     return t
 
 
+def parse_foreground(out):
+    """`ps -t TTY -o pid=,pgid=,tpgid=,comm=` -> the name of what holds the terminal: the
+    foreground group's non-shell member if it has one (conservative), else its shell; None
+    when nothing is in the foreground. Names are basenames ('-zsh', 'claude', 'node')."""
+    fg = []
+    for line in (out or "").splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, pgid, tpgid = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        if tpgid > 0 and pgid == tpgid:
+            fg.append((pid, os.path.basename(parts[3].strip())))
+    if not fg:
+        return None
+    others = [name for _, name in fg if name not in SHELL_JOBS]
+    return others[0] if others else fg[0][1]
+
+
+def foreground_job(tty):
+    """What holds TTY's foreground, from ps (the kernel's view; iTerm2's jobName lags it
+    after a process exits). None when ps fails or the tty has no foreground group."""
+    t = norm_tty(tty)
+    if not t:
+        return None
+    try:
+        rc, out = _run_rc(["ps", "-t", t, "-o", "pid=,pgid=,tpgid=,comm="])
+    except ProcsError:
+        return None
+    return parse_foreground(out) if rc == 0 else None
+
+
 def parse_ps_tree(out):
     """Parse `ps -axo pid=,ppid=,comm=` into {pid: (ppid, comm)}."""
     tree = {}
