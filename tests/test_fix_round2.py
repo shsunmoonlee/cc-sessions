@@ -260,13 +260,25 @@ class Item4Restored(TempEnv):
         ledger.apply_event(self.conn, "SessionStart", {"session_id": "a", "source": "resume"}, None)
         self.assertIsNone(ledger.get(self.conn, "a")["restored_at"])
 
-    def test_valid_guids_requires_one_distinct_id_per_tab(self):
+    def test_new_tabs_requires_one_distinct_id_per_tab(self):
         good = "w0t1p0:0A1B2C3D-0000-4000-8000-000000000001"
-        self.assertEqual(restore.valid_guids(good + "\n", 1), [good])
-        self.assertIsNone(restore.valid_guids("", 1))
-        self.assertIsNone(restore.valid_guids(good + "\n" + good + "\n", 2))
-        self.assertIsNone(restore.valid_guids("missing value\n", 1))
-        self.assertIsNone(restore.valid_guids(good + "\n", 2))
+        self.assertEqual(restore.new_tabs(good + "\n", 1), [(good, None)])
+        self.assertIsNone(restore.new_tabs("", 1))
+        self.assertIsNone(restore.new_tabs(good + "\n" + good + "\n", 2))
+        self.assertIsNone(restore.new_tabs("missing value\n", 1))
+        self.assertIsNone(restore.new_tabs(good + "\n", 2))
+        self.assertIsNone(restore.new_tabs(good + " /dev/ttys004\n" + good + " /dev/ttys005\n", 2))
+
+    def test_new_tabs_reads_each_tabs_tty(self):
+        a = "0A1B2C3D-0000-4000-8000-000000000001"
+        b = "0A1B2C3D-0000-4000-8000-000000000002"
+        self.assertEqual(restore.new_tabs("%s /dev/ttys031\n%s \n" % (a, b), 2),
+                         [(a, "ttys031"), (b, None)])
+        # AppleScript renders a nil tty as "missing value"; never store that as a tty
+        self.assertEqual(restore.new_tabs("%s missing value\n" % a, 1), [(a, None)])
+        self.assertEqual(restore.new_tabs("%s /dev/ttys031 x\n" % a, 1), [(a, None)])
+        self.assertEqual(restore.new_tabs("%s notatty\n" % a, 1), [(a, None)])
+        self.assertEqual(restore.new_tabs("%s /dev/ttys031\r\n" % a, 1), [(a, "ttys031")])
 
     def run_restore(self, stdout):
         fake = FakeRun(stdout)
@@ -276,6 +288,74 @@ class Item4Restored(TempEnv):
         out = []
         restore.run(self.cfg, self.conn, auto=True, out=out.append)
         return fake, out
+
+    def test_a_restored_row_takes_the_new_tabs_tty(self):
+        # the old tty belongs to another tab now; the status list and tty lookups follow it
+        self.insert(session_id="h", state="hibernated", iterm_guid="G-old-000001", pid=None,
+                    tty="ttys012", last_event_at=BOOT - 100)
+        self.run_restore("NEW-GUID-0001 /dev/ttys031\n")
+        r = ledger.get(self.conn, "h")
+        self.assertEqual((r["iterm_guid"], r["tty"]), ("NEW-GUID-0001", "ttys031"))
+        # no tty reported: unknown, never the old tab's
+        ledger.mark_restored(self.conn, "h", "NEW-GUID-0002")
+        self.assertIsNone(ledger.get(self.conn, "h")["tty"])
+
+    def test_evicting_and_resuming_leftovers_take_the_new_tty_too(self):
+        self.insert(session_id="e", state="evicting", iterm_guid="G-old-000001", pid=None,
+                    tty="ttys012", state_since=BOOT - 300, last_event_at=BOOT - 200)
+        self.insert(session_id="r", state="resuming", iterm_guid="G-old-000002", pid=None,
+                    tty="ttys013", state_since=BOOT - 300, last_event_at=BOOT - 100)
+        self.run_restore("NEW-GUID-0001 /dev/ttys031\nNEW-GUID-0002 /dev/ttys032\n")
+        self.assertEqual(ledger.get(self.conn, "e")["tty"], "ttys031")
+        self.assertEqual(ledger.get(self.conn, "r")["tty"], "ttys032")
+
+    def test_typed_rows_take_the_ids_after_the_run_rows(self):
+        self.insert(session_id="c", state="idle", pid=None, tty="ttys003", last_event_at=BOOT - 200)
+        self.insert(session_id="h", state="hibernated", iterm_guid="G-old-000001", pid=None,
+                    tty="ttys012", last_event_at=BOOT - 100)
+        fake, out = self.run_restore("RUN-GUID-0001 /dev/ttys020\nTYP-GUID-0002 /dev/ttys021\n")
+        self.assertIn("opened 2 tabs.", out)
+        h = ledger.get(self.conn, "h")
+        self.assertEqual((h["iterm_guid"], h["tty"]), ("TYP-GUID-0002", "ttys021"))
+        c = ledger.get(self.conn, "c")
+        self.assertEqual((c["tty"], c["restored_at"]), ("ttys003", None))
+
+    def test_a_session_start_that_lands_first_keeps_claudes_tty(self):
+        # resumed in another tab while osascript was still opening this one
+        self.insert(session_id="h", state="hibernated", iterm_guid="G-old-000001", pid=None,
+                    tty="ttys012", last_event_at=BOOT - 100)
+        conn = self.conn
+
+        class Racing(FakeRun):
+            def run(self, args, **kw):
+                ledger.apply_event(conn, "SessionStart", {"session_id": "h", "source": "resume"},
+                                   {"pid": 4242, "pid_start": 1, "tty": "ttys040", "interactive": True})
+                return FakeRun.run(self, args, **kw)
+        Patch(self, restore, "subprocess", Racing("NEW-GUID-0001 /dev/ttys031\n"))
+        Patch(self, restore, "iterm_guids", lambda: {"some-other-live-tab"})
+        Patch(self, restore.procs, "boot_time", lambda: BOOT)
+        restore.run(self.cfg, self.conn, auto=True, out=lambda l: None)
+        r = ledger.get(self.conn, "h")
+        self.assertNotIn(r["state"], ("hibernated", "evicting"))
+        self.assertEqual(r["tty"], "ttys040")
+        self.assertEqual((r["iterm_guid"], r["restored_at"]), ("G-old-000001", None))
+
+    def test_a_resume_claim_that_lands_first_keeps_the_row(self):
+        # a resuming leftover claimed by cc-resume in another tab: same state, new state_since
+        self.insert(session_id="r", state="resuming", iterm_guid="G-old-000001", pid=None,
+                    tty="ttys012", state_since=BOOT - 300, last_event_at=BOOT - 100)
+        conn = self.conn
+
+        class Racing(FakeRun):
+            def run(self, args, **kw):
+                ledger.claim_resume(conn, "r", 4242, 1, now=BOOT + 5)
+                return FakeRun.run(self, args, **kw)
+        Patch(self, restore, "subprocess", Racing("NEW-GUID-0001 /dev/ttys031\n"))
+        Patch(self, restore, "iterm_guids", lambda: {"some-other-live-tab"})
+        Patch(self, restore.procs, "boot_time", lambda: BOOT)
+        restore.run(self.cfg, self.conn, auto=True, out=lambda l: None)
+        r = ledger.get(self.conn, "r")
+        self.assertEqual((r["state"], r["tty"], r["iterm_guid"]), ("resuming", "ttys012", "G-old-000001"))
 
     def test_bad_guid_output_leaves_rows_and_marker_retryable(self):
         self.insert(session_id="h", state="hibernated", iterm_guid="G-old-000001", pid=None,
@@ -291,6 +371,7 @@ class Item4Restored(TempEnv):
         fake, out = self.run_restore("w0t0p0:NEW-GUID-0001\n")
         r = ledger.get(self.conn, "h")
         self.assertEqual(r["iterm_guid"], "w0t0p0:NEW-GUID-0001")
+        self.assertIsNone(r["tty"])
         self.assertIsNotNone(r["restored_at"])
         self.assertTrue(os.path.exists(self.cfg.path("bootmark")))
 

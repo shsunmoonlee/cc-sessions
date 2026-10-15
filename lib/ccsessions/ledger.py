@@ -557,11 +557,20 @@ def stamp_visible(conn, tty_guid, now=None):
     return n
 
 
-def mark_restored(conn, sid, guid, now=None):
+def mark_restored(conn, sid, guid, tty=None, now=None, seen=None):
+    """Bind a parked row to the tab restore typed its resume command into: that tab's GUID
+    and tty (None when iTerm2 gave none; the old tty belongs to another tab by now). `seen`
+    is the (state, state_since) restore picked the row with; a row that moved since (a
+    SessionStart from another tab, a resume claim, expire_resuming) is left as it is."""
     now = time.time() if now is None else now
+    sql = ("UPDATE sessions SET restored_at=?, iterm_guid=COALESCE(?, iterm_guid), tty=? "
+           "WHERE session_id=?")
+    args = [now, guid, tty, sid]
+    if seen is not None:
+        sql += " AND state=? AND state_since IS ?"
+        args += list(seen)
     with tx(conn):
-        conn.execute("UPDATE sessions SET restored_at=?, iterm_guid=COALESCE(?, iterm_guid) WHERE "
-                     "session_id=?", (now, guid, sid))
+        return conn.execute(sql, args).rowcount
 
 
 def set_guid(conn, sid, guid):
