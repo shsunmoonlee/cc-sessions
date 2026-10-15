@@ -682,7 +682,13 @@ class Fix13Restore(TempEnv):
 
     def test_osascript_returns_session_ids(self):
         lines = restore.osascript_for([("a", True), ("b", False)])
-        self.assertIn("set o to o & (id of s) & linefeed", lines)
+        self.assertIn('set o to o & (id of s) & " " & y & linefeed', lines)
+        # a tab without a tty yet must not fail the whole script
+        i = lines.index("set y to tty of s")
+        self.assertEqual(lines[i - 1], "try")
+        # read after the tab settles: a tty read right after create can come back empty
+        self.assertLess(lines.index("delay 0.4"), i)
+        self.assertEqual(lines[i + 1:i + 3], ['if y is missing value then set y to ""', "end try"])
         self.assertEqual(lines[-1], "return o")
 
 

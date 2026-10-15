@@ -145,21 +145,34 @@ def osascript_for(tabs):
                   "set first_done to true",
                   "end if",
                   "tell s to " + wt,
-                  "set o to o & (id of s) & linefeed",
-                  "delay 0.4"]
+                  "delay 0.4",
+                  'set y to ""',
+                  "try",
+                  "set y to tty of s",
+                  'if y is missing value then set y to ""',
+                  "end try",
+                  'set o to o & (id of s) & " " & y & linefeed']
     lines += ["end tell", "return o"]
     return lines
 
 
 GUID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{7,}$")
+TTY_RE = re.compile(r"^(/dev/)?tty\w+$")
 
 
-def valid_guids(stdout, n):
-    """Exactly n distinct, well-formed session ids (one per created tab), else None."""
-    ids = [l.strip() for l in (stdout or "").splitlines() if l.strip()]
+def new_tabs(stdout, n):
+    """[(session id, tty or None)] for exactly n created tabs with distinct, well-formed
+    ids, else None. Each line is "<id> <tty>"; the tty is empty when iTerm2 had none yet."""
+    tabs = []
+    for l in (stdout or "").splitlines():
+        parts = l.split()
+        if parts:
+            ok = len(parts) == 2 and TTY_RE.match(parts[1])
+            tabs.append((parts[0], procs.norm_tty(parts[1]) if ok else None))
+    ids = [g for g, _ in tabs]
     if len(ids) != n or len(set(ids)) != n or not all(GUID_RE.match(i) for i in ids):
         return None
-    return ids
+    return tabs
 
 
 def iterm_guids():
@@ -240,14 +253,17 @@ def run(cfg, conn, auto=False, dry_run=False, limit=None, include_hibernated=Fal
     for l in osascript_for(tabs):
         args += ["-e", l]
     r = subprocess.run(args, check=True, capture_output=True, text=True)
-    guids = valid_guids(r.stdout, len(tabs))
-    if guids is None:
+    opened = new_tabs(r.stdout, len(tabs))
+    if opened is None:
         out("iTerm2 did not return one session id per new tab; typed rows stay retryable and "
             "the boot marker is not written")
         return 0
     from .ledger import mark_restored
+    # the new tab's tty too: the row's old one belongs to some other tab by now
     for i, row in enumerate(typed):
-        mark_restored(conn, row["session_id"], guids[len(runs) + i])
+        guid, tty = opened[len(runs) + i]
+        mark_restored(conn, row["session_id"], guid, tty,
+                      seen=(row.get("state"), row.get("state_since")))
     if not blind:
         write_mark()
     out("opened %d tabs." % len(tabs))
