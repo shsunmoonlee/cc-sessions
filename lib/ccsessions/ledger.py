@@ -229,7 +229,9 @@ def limit_hold(conn, sid, now):
     than LIMIT_HOLD_S: an automatic resume is pending, the session only looks idle."""
     r = conn.execute(
         "SELECT ts, event, detail FROM events WHERE session_id=? AND event IN "
-        "('StopFailure', 'Stop', 'UserPromptSubmit', 'SessionStart') ORDER BY ts DESC, id DESC LIMIT 1",
+        "('StopFailure', 'Stop', 'UserPromptSubmit', 'SessionStart') AND "
+        "NOT (event='StopFailure' AND COALESCE(detail, '') LIKE '%\"agent\":1%') "
+        "ORDER BY ts DESC, id DESC LIMIT 1",
         (sid,)).fetchone()
     if r is None or r["event"] != "StopFailure" or now - r["ts"] > LIMIT_HOLD_S:
         return False
@@ -332,7 +334,12 @@ def apply_event(conn, event, payload, proc, now=None, projects=None):
             # resume (quota_auto_resume_stale / _disabled -> idle), or after LIMIT_HOLD_S.
             err = payload.get("error") or "unknown"
             detail["error"] = err
-            if err == "rate_limit":
+            if payload.get("agent_id"):
+                # it also fires inside subagents: their failure says nothing about the main
+                # thread, which reads the agent's error and carries on (or hits the limit
+                # itself and fires its own StopFailure)
+                detail["agent"] = 1
+            elif err == "rate_limit":
                 detail["hold"] = "limit"
             else:
                 _set_state(fields, row, IDLE, now)

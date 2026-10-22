@@ -98,6 +98,21 @@ class LedgerTransitions(TempEnv):
         self.assertEqual(self.ev("Stop", now=t0 + 3700)["state"], "idle")
         self.assertFalse(ledger.limit_hold(self.conn, "a1", t0 + 3701))
 
+    def test_subagent_stop_failure_leaves_the_main_thread_alone(self):
+        t0 = time.time()
+        self.ev("UserPromptSubmit", now=t0)
+        r = self.ev("StopFailure", now=t0 + 1, error="server_error", agent_id="ag1", agent_type="reviewer")
+        self.assertEqual(r["state"], "busy")
+        r = self.ev("StopFailure", now=t0 + 2, error="rate_limit", agent_id="ag1", agent_type="reviewer")
+        self.assertEqual(r["state"], "busy")
+        self.assertFalse(ledger.limit_hold(self.conn, "a1", t0 + 3))
+        # the main thread finishing still goes idle; its own limit hit still holds
+        self.assertEqual(self.ev("Stop", now=t0 + 4)["state"], "idle")
+        self.ev("UserPromptSubmit", now=t0 + 5)
+        self.ev("StopFailure", now=t0 + 6, error="rate_limit")
+        self.ev("StopFailure", now=t0 + 7, error="rate_limit", agent_id="ag2")
+        self.assertTrue(ledger.limit_hold(self.conn, "a1", t0 + 8))
+
     def test_usage_limit_hold_ends_when_resume_is_off_or_old(self):
         t0 = time.time()
         self.ev("UserPromptSubmit", now=t0)
