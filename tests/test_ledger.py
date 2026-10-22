@@ -77,7 +77,59 @@ class LedgerTransitions(TempEnv):
 
     def test_R6_stop_failure_goes_idle(self):
         self.ev("UserPromptSubmit")
-        self.assertEqual(self.ev("StopFailure")["state"], "idle")
+        self.assertEqual(self.ev("StopFailure", error="server_error")["state"], "idle")
+        self.ev("UserPromptSubmit")
+        self.assertEqual(self.ev("StopFailure")["state"], "idle")  # no error field: unknown
+
+    def test_usage_limit_stop_failure_holds_busy(self):
+        # a limit hit arms an automatic resume: the session is paused, not idle
+        t0 = time.time()
+        self.ev("UserPromptSubmit", now=t0)
+        r = self.ev("StopFailure", now=t0 + 1, error="rate_limit",
+                    last_assistant_message="You've hit your session limit · resets 4:20pm")
+        self.assertEqual(r["state"], "busy")
+        self.assertTrue(ledger.limit_hold(self.conn, "a1", t0 + 2))
+        # the idle_prompt that follows every turn does not end the hold
+        r = self.ev("Notification", now=t0 + 60, notification_type="idle_prompt")
+        self.assertEqual(r["state"], "busy")
+        # the reset: the task goes on, then finishes normally
+        r = self.ev("Notification", now=t0 + 3600, notification_type="quota_auto_resume_fired")
+        self.assertEqual(r["state"], "busy")
+        self.assertEqual(self.ev("Stop", now=t0 + 3700)["state"], "idle")
+        self.assertFalse(ledger.limit_hold(self.conn, "a1", t0 + 3701))
+
+    def test_subagent_stop_failure_leaves_the_main_thread_alone(self):
+        t0 = time.time()
+        self.ev("UserPromptSubmit", now=t0)
+        r = self.ev("StopFailure", now=t0 + 1, error="server_error", agent_id="ag1", agent_type="reviewer")
+        self.assertEqual(r["state"], "busy")
+        r = self.ev("StopFailure", now=t0 + 2, error="rate_limit", agent_id="ag1", agent_type="reviewer")
+        self.assertEqual(r["state"], "busy")
+        self.assertFalse(ledger.limit_hold(self.conn, "a1", t0 + 3))
+        # the main thread finishing still goes idle; its own limit hit still holds
+        self.assertEqual(self.ev("Stop", now=t0 + 4)["state"], "idle")
+        self.ev("UserPromptSubmit", now=t0 + 5)
+        self.ev("StopFailure", now=t0 + 6, error="rate_limit")
+        self.ev("StopFailure", now=t0 + 7, error="rate_limit", agent_id="ag2")
+        self.assertTrue(ledger.limit_hold(self.conn, "a1", t0 + 8))
+
+    def test_usage_limit_hold_ends_when_resume_is_off_or_old(self):
+        t0 = time.time()
+        self.ev("UserPromptSubmit", now=t0)
+        self.ev("StopFailure", now=t0 + 1, error="rate_limit")
+        r = self.ev("Notification", now=t0 + 2, notification_type="quota_auto_resume_disabled")
+        self.assertEqual(r["state"], "idle")
+        # a hold older than LIMIT_HOLD_S no longer protects
+        self.ev("UserPromptSubmit", now=t0 + 10)
+        self.ev("StopFailure", now=t0 + 11, error="rate_limit")
+        r = self.ev("Notification", now=t0 + 12, notification_type="idle_prompt")
+        self.assertEqual(r["state"], "busy")
+        r = self.ev("Notification", now=t0 + 12 + ledger.LIMIT_HOLD_S, notification_type="idle_prompt")
+        self.assertEqual(r["state"], "idle")
+        # a user prompt after the hold is a new turn: a plain idle_prompt ends it as usual
+        self.ev("UserPromptSubmit", now=t0 + 20 + ledger.LIMIT_HOLD_S)
+        r = self.ev("Notification", now=t0 + 80 + ledger.LIMIT_HOLD_S, notification_type="idle_prompt")
+        self.assertEqual(r["state"], "idle")
 
     def test_session_end_normal(self):
         self.ev("SessionStart", source="startup")

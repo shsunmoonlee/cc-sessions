@@ -26,8 +26,8 @@ writes focus, evictions, requests and its heartbeat. Everything else only reads.
 
 | state | set by |
 |---|---|
-| `idle` | SessionStart, Stop, StopFailure, Notification `idle_prompt` (when no subagents run) |
-| `busy` | UserPromptSubmit |
+| `idle` | SessionStart, Stop, StopFailure (any error but `rate_limit`), Notification `idle_prompt` (when no subagents run and no usage-limit hold), `quota_auto_resume_stale` / `_disabled` |
+| `busy` | UserPromptSubmit, Notification `quota_auto_resume_fired`; a StopFailure with `error: rate_limit` (the account's usage limit, an automatic resume pending) keeps the session busy for up to 26 h |
 | `waiting` | Notification `permission_prompt` / `elicitation_dialog` |
 | `ended` | SessionEnd |
 | `evicting` -> `hibernated` | the daemon, then SessionEnd (or the daemon after the grace period) |
