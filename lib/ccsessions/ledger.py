@@ -53,6 +53,9 @@ MAX_HOOK_RUNS = 2
 HOOK_SETTLE_S = 600
 
 EVENTS_KEEP_S = 30 * 86400
+# a usage-limit hold (StopFailure error=rate_limit) keeps a session busy at most this long:
+# Claude Code's automatic resume waits for a reset up to 24 h out
+LIMIT_HOLD_S = 26 * 3600
 EVICTIONS_KEEP_S = 90 * 86400
 SESSION_END_HIBERNATE_WINDOW_S = 60
 
@@ -221,6 +224,21 @@ def add_event(conn, sid, event, detail, now):
                  (now, sid, event, json.dumps(detail, separators=(",", ":")) if detail else None))
 
 
+def limit_hold(conn, sid, now):
+    """True while the session's newest turn boundary is a usage-limit StopFailure younger
+    than LIMIT_HOLD_S: an automatic resume is pending, the session only looks idle."""
+    r = conn.execute(
+        "SELECT ts, event, detail FROM events WHERE session_id=? AND event IN "
+        "('StopFailure', 'Stop', 'UserPromptSubmit', 'SessionStart') ORDER BY ts DESC, id DESC LIMIT 1",
+        (sid,)).fetchone()
+    if r is None or r["event"] != "StopFailure" or now - r["ts"] > LIMIT_HOLD_S:
+        return False
+    try:
+        return (json.loads(r["detail"] or "{}").get("hold")) == "limit"
+    except ValueError:
+        return False
+
+
 def _set_state(fields, row, new_state, now):
     if row is None or row.get("state") != new_state:
         fields["state"] = new_state
@@ -303,8 +321,21 @@ def apply_event(conn, event, payload, proc, now=None, projects=None):
                     add_event(conn, o[0], "superseded", {"by": sid}, now)
         elif event == "UserPromptSubmit":
             _set_state(fields, row, BUSY, now)
-        elif event in ("Stop", "StopFailure"):
+        elif event == "Stop":
             _set_state(fields, row, IDLE, now)
+        elif event == "StopFailure":
+            # runs INSTEAD of Stop when the turn ended on an API error. error=rate_limit is the
+            # account's usage limit: Claude Code arms an automatic resume for the reset (up to
+            # 24 h out), so the session is paused, not finished. It stays busy so the idle pass
+            # cannot hibernate it and lose that resume; the hold ends when the task goes on
+            # (UserPromptSubmit / quota_auto_resume_fired), when Claude Code gives up on the
+            # resume (quota_auto_resume_stale / _disabled -> idle), or after LIMIT_HOLD_S.
+            err = payload.get("error") or "unknown"
+            detail["error"] = err
+            if err == "rate_limit":
+                detail["hold"] = "limit"
+            else:
+                _set_state(fields, row, IDLE, now)
         elif event == "SubagentStart":
             fields["subagents"] = (row.get("subagents") or 0) + 1
         elif event == "SubagentStop":
@@ -315,9 +346,17 @@ def apply_event(conn, event, payload, proc, now=None, projects=None):
             if nt in ("permission_prompt", "elicitation_dialog"):
                 _set_state(fields, row, WAITING, now)
             elif nt == "idle_prompt":
-                # only busy -> idle (Stop does not fire on Esc); waiting stays waiting
+                # only busy -> idle (Stop does not fire on Esc); waiting stays waiting; a
+                # usage-limit hold (see StopFailure) stays busy
                 subs = fields.get("subagents", row.get("subagents") or 0)
-                if subs == 0 and state == BUSY:
+                if subs == 0 and state == BUSY and not limit_hold(conn, sid, now):
+                    _set_state(fields, row, IDLE, now)
+            elif nt == "quota_auto_resume_fired":
+                # the limit reset and Claude Code continued the task by itself
+                _set_state(fields, row, BUSY, now)
+            elif nt in ("quota_auto_resume_stale", "quota_auto_resume_disabled"):
+                # the task will not resume on its own: nothing left to protect
+                if state == BUSY:
                     _set_state(fields, row, IDLE, now)
         elif event == "SessionEnd":
             reason = payload.get("reason") or "other"
