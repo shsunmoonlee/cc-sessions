@@ -1078,14 +1078,15 @@ class ItermTabs(object):
             await iterm_call(s.async_send_text(text), "send_text")
 
     async def new_tab(self, text):
-        import iterm2
         w = self.app.current_terminal_window
         if w is None:
+            import iterm2
             w = await iterm_call(iterm2.Window.async_create(self.connection), "create window")
-            s = w.current_tab.current_session
+            t = w.current_tab
         else:
             t = await iterm_call(w.async_create_tab(), "create tab")
-            s = t.current_session
+        # a tab fresh from async_create_tab has no active session id yet: current_session is None
+        s = t.current_session or t.sessions[0]
         await iterm_call(s.async_send_text(text), "send_text")
         return s.session_id
 

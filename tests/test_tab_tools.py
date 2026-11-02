@@ -2289,3 +2289,31 @@ class Files(TempEnv):
         text = self.read("README.md")
         self.assertIn("more than half", text)
         self.assertIn("Older snapshots", text)
+
+
+class NewTabReopensAClosedSession(TempEnv):
+    """A wake whose tab is gone opens a new tab. A tab fresh from async_create_tab reports no
+    current session yet, which raised on the send and left a blank tab behind."""
+
+    def test_text_goes_to_the_new_tabs_only_session_when_none_is_current_yet(self):
+        sent = []
+
+        class Session(object):
+            session_id = "NEW-SESSION"
+
+            async def async_send_text(self, text):
+                sent.append(text)
+
+        class Tab(object):
+            current_session = None
+            sessions = [Session()]
+
+        class Window(object):
+            async def async_create_tab(self):
+                return Tab()
+
+        class App(object):
+            current_terminal_window = Window()
+
+        guid = arun(D.ItermTabs(App(), None).new_tab("resume\r"))
+        self.assertEqual((guid, sent), ("NEW-SESSION", ["resume\r"]))
