@@ -1189,6 +1189,7 @@ class Daemon(object):
         self.evict_lock = asyncio.Lock()
         self.pass_lock = asyncio.Lock()  # one pressure or idle pass at a time
         self.sort_lock = asyncio.Lock()  # one tab-sort pass at a time (tick + request)
+        self.started_at = time.time()
         self.last_fire = {}
         self.last_reap = self.last_prune = 0.0
         self.last_said = None
@@ -1625,8 +1626,8 @@ class Daemon(object):
     async def do_request(self, req):
         kind, sid = req["kind"], req.get("session_id")
         if kind == "tab-sort":
-            # queued while no daemon ran: a surprise reorder hours later helps nobody
-            if time.time() - (req.get("ts") or 0) > 2 * float(self.cfg["tick_s"]):
+            # queued while no daemon ran: a surprise reorder at daemon start helps nobody
+            if (req.get("ts") or 0) < self.started_at:
                 return "expired"
             return await self.sort_tabs(await self.snapshot(), force=True)
         if kind == "title":  # first: a restore queues one per typed tab, none needs free memory
