@@ -192,12 +192,9 @@ def last_work_time(path, chunk=TAIL_CHUNK, limit=TAIL_LIMIT):
     return None
 
 
-def activity_times(conn, cfg, rows, session_id=None):
-    """{session id: newest activity}. Events are pruned at 30 days, so a session with none left
-    gets the time from its transcript. `session_id`: that one session only."""
-    if session_id is not None:
-        rows = [r for r in rows if r["session_id"] == session_id]
-    times = newest_events(conn, session_id)
+def fill_transcript_activity(cfg, rows, times):
+    """The file half of activity_times: a row absent from `times` gets the time from its
+    transcript, written into `times`. Reads files and never SQLite: executor-safe."""
     for r in rows:
         if r["session_id"] not in times:
             path = row_transcript(r, cfg)
@@ -205,6 +202,14 @@ def activity_times(conn, cfg, rows, session_id=None):
             if ts:
                 times[r["session_id"]] = ts
     return times
+
+
+def activity_times(conn, cfg, rows, session_id=None):
+    """{session id: newest activity}. Events are pruned at 30 days, so a session with none left
+    gets the time from its transcript. `session_id`: that one session only."""
+    if session_id is not None:
+        rows = [r for r in rows if r["session_id"] == session_id]
+    return fill_transcript_activity(cfg, rows, newest_events(conn, session_id))
 
 
 def activity_time(row, events):

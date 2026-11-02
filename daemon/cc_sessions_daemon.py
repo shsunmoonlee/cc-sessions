@@ -1188,6 +1188,7 @@ class Daemon(object):
                                  swap_fn=lambda: self.off(procs.swap_pct))
         self.evict_lock = asyncio.Lock()
         self.pass_lock = asyncio.Lock()  # one pressure or idle pass at a time
+        self.sort_lock = asyncio.Lock()  # one tab-sort pass at a time (tick + request)
         self.last_fire = {}
         self.last_reap = self.last_prune = 0.0
         self.last_said = None
@@ -1291,23 +1292,27 @@ class Daemon(object):
         mode = str(self.cfg.get("tab_sort") or "off").strip().lower()
         if not force and mode != "recent":
             return "tab_sort is %s" % mode
+        async with self.sort_lock:
+            return await self._sort_tabs(focus)
+
+    async def _sort_tabs(self, focus):
         if await self.off(tab_snapshots.restore_running, self.cfg):
             return "a restore is running"
-        panes = focus.get("panes", 0)
-        if panes and focus.get("skipped", 0) == panes:
-            return "blind snapshot"
+        # any skipped pane would read as a non-Claude tab and get shoved to the back
+        if focus.get("skipped", 0):
+            return "snapshot skipped %d pane(s)" % focus["skipped"]
         now = time.time()
         states = LIVE_STATES + PARKED_STATES
         rows = ledger.all_rows(self.conn, "ended_at IS NULL AND state IN (%s)" %
                                ",".join("?" * len(states)), states)
-        events = activity.activity_times(self.conn, self.cfg, rows)
+        times = activity.newest_events(self.conn)  # the file half runs in the executor
         doc, err = tabgroups.read(self.cfg)
         if err:
             log.warning("tab sort: %s; sorting with no groups or pins", err)
         live, parked = tab_snapshots.session_index(rows)
         guid_tty = {g: t for t, g in focus["tty_guid"].items()}
         bucket_s = float(self.cfg.get("tab_sort_bucket_s") or 0)
-        moved = 0
+        wins = []
         for w in self.app.terminal_windows:
             tabs = list(w.tabs)
             if len(tabs) < 2:
@@ -1318,12 +1323,23 @@ class Daemon(object):
                     {"guid": s.session_id, "tty": guid_tty.get(s.session_id)}, live, parked)
                     for s in t.sessions]
                 tab_rows.append([r for r in matched if r])
-            order = await self.off(self._tab_order, tab_rows, events, doc, bucket_s, now)
+            wins.append((w, tabs, tab_rows))
+        if not wins:
+            return "moved 0 tab(s)"
+        orders = await self.off(self._tab_orders, [trs for _, _, trs in wins],
+                                times, doc, bucket_s, now)
+        moved = 0
+        for (w, tabs, _), order in zip(wins, orders):
             if order == list(range(len(tabs))):
                 continue
             n = sum(1 for pos, i in enumerate(order) if pos != i)
             if self.dry_run:
                 log.info("DRY RUN would move %d tab(s) in window %s", n, w.window_id)
+                continue
+            # the executor pass took time: a window the user changed meanwhile is skipped,
+            # or async_set_tabs would move a torn-off tab back (and close its new window)
+            if [t.tab_id for t in w.tabs] != [t.tab_id for t in tabs]:
+                log.info("tab sort: window %s changed during the pass; skipped", w.window_id)
                 continue
             await iterm_call(w.async_set_tabs([tabs[i] for i in order]), "set_tabs")
             moved += n
@@ -1331,14 +1347,16 @@ class Daemon(object):
             log.info("tab sort moved %d tab(s)", moved)
         return "moved %d tab(s)" % moved
 
-    def _tab_order(self, tab_rows, events, doc, bucket_s, now):
-        """The blocking half of a sort (work_reason reads transcripts and ps): executor
-        work, no SQLite."""
+    def _tab_orders(self, window_tab_rows, times, doc, bucket_s, now):
+        """The blocking half of a sort, one pass for every window (work_reason and the
+        activity fallback read transcripts and ps): executor work, no SQLite."""
+        rows = [r for trs in window_tab_rows for tab in trs for r in tab]
+        activity.fill_transcript_activity(self.cfg, rows, times)
         facts = Facts(self.cfg, now)
 
         def work(row):
             return activity.work_reason(row, now, self.cfg, facts.analysis, facts.children)
-        return tabsort.order(tab_rows, events, doc, work, bucket_s)
+        return [tabsort.order(trs, times, doc, work, bucket_s) for trs in window_tab_rows]
 
     def heartbeat(self):
         now = time.time()
@@ -1607,6 +1625,9 @@ class Daemon(object):
     async def do_request(self, req):
         kind, sid = req["kind"], req.get("session_id")
         if kind == "tab-sort":
+            # queued while no daemon ran: a surprise reorder hours later helps nobody
+            if time.time() - (req.get("ts") or 0) > 2 * float(self.cfg["tick_s"]):
+                return "expired"
             return await self.sort_tabs(await self.snapshot(), force=True)
         if kind == "title":  # first: a restore queues one per typed tab, none needs free memory
             row = ledger.get(self.conn, sid)
