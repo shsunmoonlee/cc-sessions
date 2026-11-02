@@ -46,11 +46,18 @@ if _LIB and _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 
 from ccsessions import (BUSY, EVICTING, HIBERNATED, IDLE, LIVE_STATES,  # noqa: E402
-                        RESUMING, config, ledger, pending, procs, resumecmd)
+                        PARKED_STATES, RESUMING, config, ledger, pending, procs, resumecmd)
+from ccsessions import tabs as tab_snapshots  # noqa: E402
 
 log = logging.getLogger("cc-sessions")
 
 RESUME_DEBOUNCE_S = 20
+# restore opens every tab in one burst, and each selected_tab_changed queues a focus event
+# that is handled after the bind. The command is typed in the tab: Enter works meanwhile.
+RESTORE_SETTLE_S = 60
+# a tab restore just opened may still be starting its shell when its title request comes
+TITLE_RETRY_S = 30
+REQUEST_RETRY = object()  # do_request: leave the request queued for the next poll
 SESSION_END_WAIT_S = 5
 TAB_SHELL_WAIT_S = 20
 REQUEST_POLL_S = 5
@@ -284,6 +291,8 @@ def resume_decision(row, guid, tty, now, last_fire, job, identity_alive):
         return "no tab GUID recorded; use cc-sessions wake"
     if row["iterm_guid"] != guid:
         return "tab GUID changed (tty reused by another tab)"
+    if row.get("restored_at") and now - row["restored_at"] < RESTORE_SETTLE_S:
+        return "restored %ds ago; press Enter to resume" % (now - row["restored_at"])
     if job is not None and job not in procs.SHELL_JOBS:
         return "tab is running %s" % job
     if identity_alive(row):
@@ -1198,6 +1207,17 @@ async def focus_snapshot(app):
             "panes": len(panes), "skipped": len(skipped)}
 
 
+def tab_layout(app, tty_guid):
+    """The ordered windows, tabs and panes for a tab snapshot, from what the app already
+    knows plus focus_snapshot's tty_guid inverted: no RPC."""
+    guid_tty = {g: t for t, g in tty_guid.items()}
+    return [{"window_id": w.window_id,
+             "tabs": [{"tab_id": t.tab_id,
+                       "sessions": [{"guid": s.session_id, "tty": guid_tty.get(s.session_id)}
+                                    for s in t.sessions]} for t in w.tabs]}
+            for w in app.terminal_windows]
+
+
 class Daemon(object):
     MAX_TICK_FAILURES = 3
     SNAPSHOT_TIMEOUT_S = 15
@@ -1221,6 +1241,7 @@ class Daemon(object):
         self.visible = {}  # tty -> guid shown right now
         self.blind_since = None
         self.last_blind_meta = None
+        self.instance = None  # this daemon's iTerm2: it exits on any connection loss
 
     async def off(self, fn, *args):
         """Blocking work (ps, transcript reads, stats) in an executor; SQLite stays here."""
@@ -1276,6 +1297,30 @@ class Daemon(object):
         both.update(new)
         ledger.stamp_visible(self.conn, both, now)
         self.visible = new
+
+    async def write_tab_snapshot(self, focus, now=None):
+        """The ordered tab list, to the file `restore` reads. A failure is logged and never
+        fails the tick. A snapshot whose every tty read failed is not written: it would
+        replace a good file with one where no tab has a session. -> write_snapshot's word."""
+        try:
+            panes = focus.get("panes", 0)
+            if panes and focus.get("skipped", 0) == panes:
+                return None
+            windows = tab_layout(self.app, focus["tty_guid"])
+            if not windows:
+                return None
+            if self.instance is None:
+                self.instance = await self.off(tab_snapshots.iterm_instance)
+                if self.instance is None:
+                    return None
+            states = LIVE_STATES + PARKED_STATES
+            rows = ledger.all_rows(self.conn, "ended_at IS NULL AND state IN (%s)" %
+                                   ",".join("?" * len(states)), states)
+            snap = tab_snapshots.build_snapshot(self.instance, windows, rows, now)
+            return await self.off(tab_snapshots.write_snapshot, self.cfg, snap)
+        except Exception:
+            log.exception("tab snapshot failed")
+            return None
 
     def heartbeat(self):
         now = time.time()
@@ -1440,6 +1485,7 @@ class Daemon(object):
             except Exception:
                 log.exception("on_evict sweep failed; retried next tick")
         focus = await self.snapshot()
+        await self.write_tab_snapshot(focus, now)
         self.stamp_visibility(focus, now)
         if now - self.last_reap > REAP_EVERY_S:
             from ccsessions import cli
@@ -1528,12 +1574,17 @@ class Daemon(object):
             except Exception as exc:
                 log.exception("request %s failed", req["id"])
                 result = "error: %s" % exc
+            if result is REQUEST_RETRY:
+                continue
             with ledger.tx(self.conn):
                 self.conn.execute("UPDATE requests SET done_at=?, result=? WHERE id=?",
                                   (time.time(), result, req["id"]))
 
     async def do_request(self, req):
         kind, sid = req["kind"], req.get("session_id")
+        if kind == "title":  # first: a restore queues one per typed tab, none needs free memory
+            row = ledger.get(self.conn, sid)
+            return await self.title_tab(row, req.get("ts")) if row else "unknown session"
         free = await self.off(procs.free_pct)
         if kind == "hibernate":
             row = ledger.get(self.conn, sid)
@@ -1558,6 +1609,33 @@ class Daemon(object):
             res = [await self.wake(r) for r in rows]
             return "woke %d (limit %d)" % (res.count("resumed"), limit)
         return "unknown request kind"
+
+    async def title_tab(self, row, requested_at=None):
+        """Name a restored typed tab "[zz] <title>" while its row is hibernated and the tab
+        is at a shell. On a fresh tab async_set_name only changes session.autoName and the
+        tab still shows -zsh, so the visible title goes through OSC 0 (probed 2026-11-02);
+        inject writes to the display, never to the typed command."""
+        if row.get("state") != HIBERNATED:
+            return "state=%s" % row.get("state")
+        guid = row.get("iterm_guid")
+        if not guid:
+            return "no tab GUID"
+        job = await self.tabs.job_name(guid)
+        if job is None:
+            return "tab is gone"
+        job = await settled_job(job, procs.norm_tty(await self.tabs.tty(guid)), self.off,
+                                self.prompt_recheck)
+        if not is_shell_job(job):
+            if requested_at and time.time() - requested_at < TITLE_RETRY_S:
+                return REQUEST_RETRY
+            return "tab is running %s" % job
+        name = "[zz] %s" % tab_snapshots.clean_title(await self.resume_title(row))
+        if self.dry_run:
+            log.info("DRY RUN would title %s %r", row["session_id"][:8], name)
+            return "dry-run"
+        await self.tabs.inject(guid, ("\x1b]0;%s\x07" % name).encode("utf-8"))
+        await self.tabs.set_name(guid, name)
+        return "titled"
 
     async def wake(self, row):
         if row.get("state") != HIBERNATED:
@@ -1638,6 +1716,13 @@ class Daemon(object):
             if why != "debounce":
                 log.info("focus %s: not resuming %s: %s", tty, row["session_id"][:8], why)
             self.last_fire[guid] = now
+            return
+        # focus_loop drains its queue serially, a full snapshot per event: a queued event for
+        # a tab flipped past (or one of restore's burst) arrives long after the selection
+        # moved on. Not debounced: a click back on this tab must still resume it. No window
+        # list at all means there is nothing to compare against.
+        if getattr(self.app, "terminal_windows", None) and not await self.tabs.is_visible(guid):
+            log.info("focus %s: not resuming %s: no longer selected", tty, row["session_id"][:8])
             return
         self.last_fire[guid] = now
         if self.dry_run:

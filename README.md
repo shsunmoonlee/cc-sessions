@@ -131,7 +131,8 @@ cc-sessions hibernate <sid>|--all-idle   ask the daemon (explicit: skips pressur
 cc-sessions wake <sid>|--all         resume in the original tab, or a new tab if it is gone
 cc-sessions pending <transcript>     {"pending": [...], "last_text": "..."}; unreadable = pending
 cc-sessions holds <path> [-v]        exit 0 held, 1 free, 2 ledger unreadable (treat != 1 as held)
-cc-sessions restore [--auto] [--dry-run] [--limit N] [--include-hibernated] [--max-age-days N]
+cc-sessions restore [--auto] [--dry-run] [--snapshot PATH] [--limit N] [--include-hibernated] [--max-age-days N]
+cc-sessions tabs [--json]            tab snapshots, and what restore would open now
 cc-sessions import-legacy [--manifests DIR] [--registry DIR]
 cc-sessions doctor                   PASS/FAIL checks, exit 1 on any FAIL
 cc-sessions reap [--dry-run]         delete dead-pid sockets; list (never kill) orphans
@@ -142,8 +143,41 @@ cc-resume <sid> [--cwd DIR] [--dry-run]   resume a session, unparking its worktr
 
 ### restore
 
-Restores sessions whose process is gone but whose SessionEnd never arrived (crash, power
-loss), plus the shutdown cluster: sessions that ended with reason `other` together, right
+The daemon writes the ordered tab list to a JSON file on every tick where it changed, one
+file per iTerm2 process lifetime, in `tab_snapshots_dir` (the newest 20 are kept). The last
+write of a dead iTerm2 instance is the state at death, whatever killed it: power loss, kernel
+panic, WindowServer, an iTerm2 crash or a clean quit. `restore` reopens the newest snapshot of
+an instance that is no longer running, in one new window, in order:
+
+- a tab that was running a session runs its resume command (one tab every 3 s, since each
+  resume loads its MCP servers); a hibernated tab gets the command typed but not run, and its
+  `[zz]` title, and resumes when you click it and press Enter (focus alone does not resume it
+  for the first 60 s);
+- a session you exited (`/exit`, Ctrl-D), one still running, or one whose tab is still open is
+  skipped, so a second run opens nothing. A tab you closed before the crash is not in the
+  file, and one you close after restoring it does not come back;
+- sessions started after the last write are appended, newest first; a tab with no session is
+  not reopened. There is no age or count limit: the tab was open. A missing cwd is reported,
+  unless cc-resume can rebuild the worktree.
+
+`--auto` consumes a snapshot at most once (a `.restored` marker beside it); manual runs ignore
+the marker and rely on the filters above. `--snapshot PATH` picks another file, `--dry-run`
+prints the plan. Only one restore runs at a time; a second prints `restore already running`.
+If a running iTerm2 cannot be asked for its tabs, restore aborts rather than open blind. A
+write that more than halves the tab count first keeps the old file as
+`<name>.before-shrink-<time>.json`: a clean quit can tear tabs down between ticks, and
+`tabs` lists such a file for `--snapshot`. `--limit`, `--include-hibernated` and
+`--max-age-days` apply only to the legacy path below.
+
+Window order in the file is iTerm2's creation order, not screen order.
+
+`contrib/hammerspoon/cc_sessions_menu.lua` is a menu bar item for this (`cc ⟲N` when N
+sessions are pending): restore, preview, older snapshots, the log. `make install` copies it to
+`~/.hammerspoon/` when that exists; require it in a pcall from `init.lua` and call `start()`.
+The first restore from it may ask for an Automation grant (Hammerspoon to iTerm2).
+
+On a machine with no snapshot yet, the legacy path restores sessions whose process is gone but
+whose SessionEnd never arrived (crash, power loss), plus the shutdown cluster: sessions that ended with reason `other` together, right
 before boot. A deliberate exit is never restored. `--auto` (for a login launchd job) runs at
 most once per boot, only for sessions last active before boot, and also retypes (without
 running) the resume command for hibernated sessions whose tab no longer exists.
@@ -167,6 +201,7 @@ path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file tha
 | key | default | |
 |---|---|---|
 | `db` | `~/.claude/state/cc-sessions.db` | the ledger |
+| `tab_snapshots_dir` | `cc-sessions-tabs` beside the ledger | tab snapshots (`~/.claude/state/cc-sessions-tabs` with the default ledger) |
 | `low_free_pct` / `high_free_pct` | 20 / 35 | evict below, stop at |
 | `swap_high_pct` | 75 | swap used % that counts as memory pressure (0 = off) |
 | `idle_min` | 10 | minutes idle, unfocused and without file activity |

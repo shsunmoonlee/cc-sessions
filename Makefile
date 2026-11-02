@@ -9,6 +9,8 @@ BIN_FILES  = cc-sessions cc-resume
 LIB_FILES  = $(notdir $(wildcard lib/ccsessions/*.py))
 LIBDIR     = $(PREFIX)/lib/cc-sessions
 PLIST      = com.cc-sessions.daemon.plist
+HAMMERSPOON ?= $(HOME)/.hammerspoon
+MENU_LUA   = cc_sessions_menu.lua
 
 .PHONY: install uninstall check test release-check render-plist
 
@@ -20,6 +22,7 @@ install: render-plist
 	for f in $(filter-out __init__.py,$(LIB_FILES)) __init__.py; do install -m 644 lib/ccsessions/$$f $(LIBDIR)/ccsessions/$$f; done
 	install -m 644 daemon/cc_sessions_daemon.py $(LIBDIR)/cc_sessions_daemon.py
 	install -m 644 build/$(PLIST) $(LAUNCHAGENTS)/$(PLIST)
+	@if [ -d "$(HAMMERSPOON)" ]; then install -m 644 contrib/hammerspoon/$(MENU_LUA) $(HAMMERSPOON)/$(MENU_LUA); fi
 	@echo "installed. load the daemon with:"
 	@echo "  launchctl bootstrap gui/$$(id -u) $(LAUNCHAGENTS)/$(PLIST)"
 	@echo "or restart a running one (it keeps the old code until then):"
@@ -43,6 +46,7 @@ check: render-plist
 	for f in $(LIB_FILES); do cmp -s lib/ccsessions/$$f $(LIBDIR)/ccsessions/$$f || { echo "differs: $(LIBDIR)/ccsessions/$$f"; rc=1; }; done; \
 	cmp -s daemon/cc_sessions_daemon.py $(LIBDIR)/cc_sessions_daemon.py || { echo "differs: $(LIBDIR)/cc_sessions_daemon.py"; rc=1; }; \
 	cmp -s build/$(PLIST) $(LAUNCHAGENTS)/$(PLIST) || { echo "differs: $(LAUNCHAGENTS)/$(PLIST)"; rc=1; }; \
+	if [ -d "$(HAMMERSPOON)" ]; then cmp -s contrib/hammerspoon/$(MENU_LUA) $(HAMMERSPOON)/$(MENU_LUA) || { echo "differs: $(HAMMERSPOON)/$(MENU_LUA)"; rc=1; }; fi; \
 	[ $$rc -eq 0 ] && echo "installed copies match the repo"; exit $$rc
 
 test:

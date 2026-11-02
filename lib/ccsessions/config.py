@@ -53,6 +53,8 @@ DEFAULTS = {
     "wake_all_limit": 10,
     "restore_max_age_days": 7,
     "bootmark": "~/.cache/cc-sessions.bootmark",
+    # null = cc-sessions-tabs beside the ledger (~/.claude/state/cc-sessions-tabs by default)
+    "tab_snapshots_dir": None,
     # What gets typed into a tab to resume a session. null = the cc-resume installed
     # next to this package (bin/cc-resume).
     "resume_command": None,
@@ -69,7 +71,7 @@ DEFAULTS = {
 
 PATH_KEYS = ("db", "daemon_python", "claude_projects", "claude_sessions", "claude_settings",
              "claude_tmp", "log", "sock_dir", "bootmark", "legacy_manifests", "launchd_plist",
-             "on_evict")
+             "on_evict", "tab_snapshots_dir")
 
 
 def expand(p):
