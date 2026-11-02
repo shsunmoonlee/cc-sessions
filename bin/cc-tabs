@@ -1,0 +1,609 @@
+#!/usr/bin/python3
+"""cc-tabs: find, sort, close, group and pin the iTerm2 tabs of Claude Code sessions. Nothing
+here runs by itself; every command acts when asked and never moves or closes a tab otherwise.
+
+  cc-tabs sort [--all] [--dry-run]          pinned, needs you, working, the rest, other tabs
+  cc-tabs find [--json]                     every resumable session, newest first
+  cc-tabs open <session_id>                 select its tab, or wake it in a new one
+  cc-tabs close-idle [--days 7] [--dry-run] [--json] [--only ID,ID]
+                                            close tabs of long-hibernated sessions
+  cc-tabs group add <name> [--session ID]   also: remove, rename, delete, color, list
+  cc-tabs pin [--session ID] [--toggle]     also: unpin
+  cc-tabs recolor                           reapply group colors to open tabs
+
+Reads (find, group list) stay on the system python. Everything that talks to iTerm2 re-execs
+on the daemon's python, which has the `iterm2` package."""
+import argparse
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+
+
+def _libdir():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in (os.path.join(here, "..", "lib", "cc-sessions"), os.path.join(here, "..", "lib")):
+        if os.path.isdir(os.path.join(c, "ccsessions")):
+            return os.path.normpath(c)
+    return None
+
+
+_LIB = _libdir()
+if _LIB and _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+
+from ccsessions import (HIBERNATED, LIVE_STATES, PARKED_STATES, activity, cli, config, ledger,  # noqa: E402
+                        procs, restore, tabgroups)
+from ccsessions import tabs as tabfile  # noqa: E402
+
+REEXEC_ENV = "CC_TABS_REEXEC"
+
+
+def need_iterm2(cfg):
+    """The iterm2 package: from this python, else from re-running this script on daemon_python."""
+    try:
+        import iterm2
+        return iterm2
+    except ImportError:
+        pass
+    py = cfg.path("daemon_python")
+    if os.environ.get(REEXEC_ENV) or not os.access(py, os.X_OK):
+        sys.exit("cc-tabs: the iterm2 package is missing; set up %s (config daemon_python)" % py)
+    os.environ[REEXEC_ENV] = "1"
+    os.execv(py, [py, os.path.abspath(__file__)] + sys.argv[1:])
+
+
+def request_cookie():
+    """Only after iterm_running(): asking AppleScript launches an iTerm2 that is not running."""
+    if os.environ.get("ITERM2_COOKIE"):
+        return
+    r = subprocess.run(["osascript", "-e", 'tell application id "com.googlecode.iterm2" to '
+                        'request cookie and key for app named "cc-tabs"'],
+                       capture_output=True, text=True, timeout=30)
+    parts = r.stdout.strip().split()
+    if r.returncode != 0 or len(parts) != 2:
+        sys.exit("cc-tabs: iTerm2 refused a cookie: %s" % (r.stderr.strip()[:160] or "empty reply"))
+    os.environ["ITERM2_COOKIE"], os.environ["ITERM2_KEY"] = parts
+
+
+def iterm_running():
+    return tabfile.iterm_instance() is not None
+
+
+def with_app(cfg, fn):
+    """Run `await fn(app)` on one connection and return its exit code. The iterm2 package turns
+    an exception into a traceback + sys.exit, so the error is reported here instead."""
+    iterm2 = need_iterm2(cfg)
+    request_cookie()
+    result = {"rc": 1}
+
+    async def main(connection):
+        try:
+            result["rc"] = await fn(await iterm2.async_get_app(connection))
+        except tabgroups.GroupsError as exc:
+            print("cc-tabs: %s" % exc, file=sys.stderr)
+        except Exception as exc:
+            print("cc-tabs: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
+    iterm2.run_until_complete(main, retry=False)
+    return result["rc"]
+
+
+# ------------------------------------------------------------------ tabs and sessions
+
+def running(row):
+    """Unknown counts as running: a row without a start time cannot be told from a dead one."""
+    return procs.identity_probe(row.get("pid"), row.get("pid_start")) != procs.GONE
+
+
+def memo_running():
+    """One probe per process for one pass: match_panes runs often, and each probe is a ps."""
+    seen = {}
+
+    def check(row):
+        key = (row.get("pid"), row.get("pid_start"))
+        if key not in seen:
+            seen[key] = running(row)
+        return seen[key]
+    return check
+
+
+def open_rows(conn):
+    states = LIVE_STATES + PARKED_STATES
+    return ledger.all_rows(conn, "ended_at IS NULL AND state IN (%s)" % ",".join("?" * len(states)), states)
+
+
+async def pane_tty(session):
+    try:
+        return procs.norm_tty(await session.async_get_variable("tty"))
+    except Exception:
+        return None
+
+
+async def window_tabs(win):
+    """[{"tab", "panes": [{"guid", "tty", "session"}]}] in tab order."""
+    out = []
+    for tab in win.tabs:
+        ttys = await asyncio.gather(*[pane_tty(s) for s in tab.sessions])
+        out.append({"tab": tab, "panes": [{"guid": s.session_id, "tty": t, "session": s}
+                                          for s, t in zip(tab.sessions, ttys)]})
+    return out
+
+
+def make_color(color):
+    import iterm2
+    return iterm2.color.Color(*tabgroups.rgb(color))
+
+
+async def set_tab_color(session, color):
+    """Through the session's own profile object, so the shared profile stays as it is: its writes
+    carry the session id, not a profile GUID (WriteOnlyProfile._guids_for_set)."""
+    profile = await session.async_get_profile()
+    if color:
+        await profile.async_set_tab_color(make_color(color))
+        await profile.async_set_use_tab_color(True)
+    else:
+        await profile.async_set_use_tab_color(False)
+
+
+async def paint(app, conn, colors):
+    """Set each session's tab color wherever its tab is open. colors: {sid: "#rrggbb" or None}.
+    Best effort. -> tabs changed."""
+    if not colors:
+        return 0
+    rows = open_rows(conn)
+    alive = memo_running()
+    bound = {r["iterm_guid"]: r for r in rows if r.get("iterm_guid")}
+    changed = 0
+    for win in app.terminal_windows:
+        tabs = await window_tabs(win)
+        panes = [p for t in tabs for p in t["panes"]]
+        matched = tabfile.match_panes(panes, rows, alive)
+        for p in panes:
+            # a tab restore just opened is bound by GUID before its process has started
+            row = matched.get(p["guid"]) or bound.get(p["guid"])
+            if row and row["session_id"] in colors:
+                try:
+                    await set_tab_color(p["session"], colors[row["session_id"]])
+                    changed += 1
+                except Exception as exc:
+                    print("cc-tabs: could not color %s: %s" % (row["session_id"][:8], exc), file=sys.stderr)
+    return changed
+
+
+def group_colors(doc):
+    """{sid: color} for members of groups that have a color. A group without one leaves its tabs
+    alone: there is no default color, and a tab colored by hand stays that way."""
+    return {s: tabgroups.color_of(doc, s) for s in doc["sessions"] if tabgroups.color_of(doc, s)}
+
+
+# ------------------------------------------------------------------ sort
+
+async def sort_window(cfg, conn, win, doc, dry_run=False, out=print, now=None):
+    """Reorder one window. Reordering moves tabs, it does not select one (rpc reorder_tabs has no
+    selection in it), so no focus event wakes anything. -> how many tabs changed position."""
+    now = time.time() if now is None else now
+    tabs = await window_tabs(win)
+    panes = [p for t in tabs for p in t["panes"]]
+    matched = tabfile.match_panes(panes, open_rows(conn), memo_running())
+    events = activity.newest_events(conn)
+    facts = activity.Facts(cfg, now)
+
+    def work(row):
+        return activity.work_reason(row, now, cfg, facts.analysis, facts.children)
+
+    infos = []
+    for t in tabs:
+        t["rows"] = [matched[p["guid"]] for p in t["panes"] if matched.get(p["guid"])]
+        infos.append(activity.tab_info(t["rows"], events, lambda s: tabgroups.group_of(doc, s),
+                                       lambda s: tabgroups.is_pinned(doc, s), work))
+    order = activity.sort_order(infos)
+    moved = sum(1 for pos, i in enumerate(order) if pos != i)
+    if dry_run:
+        for pos, i in enumerate(order):
+            rows, info = tabs[i]["rows"], infos[i]
+            title = activity.display_title(rows[0])[:60] if rows else "(no session)"
+            group = " [%s]" % info["group"] if info["group"] else ""
+            out("%3d %s %-9s %s%s" % (pos + 1, "*" if pos != i else " ", activity.BUCKET_NAMES[info["bucket"]],
+                                      title, group))
+        return moved
+    if moved:
+        await win.async_set_tabs([tabs[i]["tab"] for i in order])
+    return moved
+
+
+async def cmd_sort_app(cfg, conn, app, a, out=print):
+    doc, err = tabgroups.read(cfg)
+    if err:
+        print("cc-tabs: %s; sorting with no groups or pins" % err, file=sys.stderr)
+    wins = app.terminal_windows if a.all else [app.current_terminal_window]
+    moved = 0
+    for win in (w for w in wins if w):
+        moved += await sort_window(cfg, conn, win, doc, a.dry_run, out)
+    if a.dry_run:
+        out("would move %d tabs" % moved)
+        return 0
+    await paint(app, conn, group_colors(doc))
+    out("moved %d tabs" % moved)
+    return 0
+
+
+def cmd_sort(cfg, conn, a):
+    if not iterm_running():
+        print("iTerm2 is not running")
+        return 0
+    return with_app(cfg, lambda app: cmd_sort_app(cfg, conn, app, a))
+
+
+# ------------------------------------------------------------------ find, open
+
+def find_data(cfg, conn, live_guids):
+    doc, err = tabgroups.read(cfg)
+    if err:
+        print("cc-tabs: %s" % err, file=sys.stderr)
+    return activity.find_rows(activity.resumable_rows(conn), activity.newest_events(conn),
+                              lambda s: tabgroups.group_of(doc, s), lambda s: tabgroups.is_pinned(doc, s),
+                              live_guids)
+
+
+def cmd_find(cfg, conn, a):
+    # iterm_guids asks over osascript only when iTerm2 is running, and needs no iterm2 package
+    rows = find_data(cfg, conn, restore.iterm_guids())
+    if a.json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    now = time.time()
+    for d in rows:
+        print("%-8s %-6s %-10s %-4s %s  %s" % (d["session_id"][:8], cli._age(now, d["activity"]), d["state"],
+                                               "open" if d["tab_open"] else "-", d["title"][:60], d["group"]))
+    return 0
+
+
+async def open_in_app(app, row, rows):
+    """Select the row's tab, raise its window, activate iTerm2. Selecting a hibernated row's tab
+    resumes it through the daemon's focus handler, but a tab already selected fires no focus
+    event. -> True when that is all it takes, False when the daemon must wake it: its hibernated
+    tab was already selected, or no tab holds it. begin_resume keeps a late focus event from
+    resuming it a second time."""
+    await app.async_refresh()
+    where = []
+    for win in app.terminal_windows:
+        where += [(win, t["tab"], p) for t in await window_tabs(win) for p in t["panes"]]
+    matched = tabfile.match_panes([p for _, _, p in where], rows, memo_running())
+    for win, tab, p in where:
+        hit = matched.get(p["guid"])
+        if hit and hit["session_id"] == row["session_id"]:
+            selected = win.current_tab is not None and win.current_tab.tab_id == tab.tab_id \
+                and tab.current_session is not None and tab.current_session.session_id == p["guid"]
+            await p["session"].async_activate(select_tab=True, order_window_front=True)
+            await app.async_activate(raise_all_windows=False, ignoring_other_apps=True)
+            return not (selected and hit.get("state") == HIBERNATED)
+    return False
+
+
+def cmd_open(cfg, conn, a):
+    sid = cli.resolve_sid(conn, a.session_id)
+    row = ledger.get(conn, sid)
+    if not row:
+        print("unknown session %s" % sid, file=sys.stderr)
+        return 1
+
+    async def in_app(app):
+        return 0 if await open_in_app(app, row, open_rows(conn)) else 3
+
+    rc = with_app(cfg, in_app) if iterm_running() else 3
+    return cli._request(cfg, "wake", sid) if rc == 3 else rc
+
+
+# ------------------------------------------------------------------ close-idle
+
+def refusal(win, tab, pane, rows, doc, events_fn, days, now):
+    """-> (row, why this pane's tab must stay open or None). A window that cannot say which tab
+    is selected closes nothing. Mapping is unfiltered here on purpose: a dead live row on the
+    tty hides the parked one, which only ever keeps a tab open."""
+    is_current = win.current_tab is None or win.current_tab.tab_id == tab.tab_id
+    live, parked = tabfile.session_index(rows)
+    row = tabfile.pane_row(pane, live, parked)
+    entry = tabgroups.entry(doc, row["session_id"]) if row else {}
+    last = activity.activity_time(row, events_fn(row["session_id"])) if row else 0
+    return row, activity.close_refusal(row, len(tab.sessions), is_current, now, days, entry, last,
+                                       procs.identity_probe, lambda: procs.foreground_job(pane["tty"]))
+
+
+async def close_candidates(cfg, conn, app, days, now=None, only=None):
+    """[(tab, pane, row)] that pass every refusal now. `only`: session ids, at most these."""
+    doc = tabgroups.load(cfg)  # raises when unreadable: it hides who is grouped or pinned
+    now = time.time() if now is None else now
+    await app.async_refresh()
+    rows = open_rows(conn)
+    events = activity.newest_events(conn)
+    closing = []
+    for win in app.terminal_windows:
+        for t in await window_tabs(win):
+            for pane in t["panes"]:
+                row, why = refusal(win, t["tab"], pane, rows, doc, lambda s: events, days, now)
+                if not why and (only is None or row["session_id"] in only):
+                    closing.append((t["tab"], pane, row))
+    return closing
+
+
+def window_of(app, tab):
+    """The window holding this tab now: a refresh keeps Tab objects, and a tab can be dragged."""
+    return next((w for w in app.terminal_windows if any(t.tab_id == tab.tab_id for t in w.tabs)), None)
+
+
+async def close_recheck(cfg, conn, app, days, tab, pane, row):
+    """Why this tab must stay open after all, None to close it. Right before the close."""
+    await app.async_refresh()
+    pane["tty"] = await pane_tty(pane["session"])
+    if tabfile.restore_running(cfg):
+        return "a restore is running"
+    win = window_of(app, tab)
+    if win is None:
+        return "its tab is gone"
+    fresh, why = refusal(win, tab, pane, open_rows(conn), tabgroups.load(cfg),
+                         lambda s: activity.newest_events(conn, s), days, time.time())
+    if not why and fresh["session_id"] != row["session_id"]:
+        return "another session is in that tab now"
+    return why
+
+
+async def close_idle(cfg, conn, app, days, dry_run=False, out=print, now=None, only=None):
+    """-> tabs closed (or that would be). Each is re-checked right before it closes; close_refusal
+    is the whole rule. The ledger row stays hibernated, so the picker and `wake` still reach it."""
+    closing = await close_candidates(cfg, conn, app, days, now, only)
+    if dry_run:
+        for _, _, row in closing:
+            out("  %s" % activity.display_title(row)[:70])
+        out("would close %d tabs" % len(closing))
+        return len(closing)
+    closed = 0
+    for tab, pane, row in closing:
+        why = await close_recheck(cfg, conn, app, days, tab, pane, row)
+        if why:
+            out("  kept %s: %s" % (activity.display_title(row)[:60], why))
+            continue
+        try:
+            await pane["session"].async_close(force=True)
+            closed += 1
+        except Exception as exc:
+            out("  could not close %s: %s" % (activity.display_title(row)[:60], exc))
+    out("closed %d tabs" % closed)
+    return closed
+
+
+def parse_ids(text):
+    return {s for s in text.split(",") if s}
+
+
+def cmd_close_idle(cfg, conn, a):
+    if a.json and not a.dry_run:
+        print("cc-tabs: close-idle --json needs --dry-run", file=sys.stderr)
+        return 2
+    if not iterm_running():
+        if a.json:
+            print(json.dumps({"count": 0, "session_ids": []}))
+        else:
+            print("%s 0 tabs" % ("would close" if a.dry_run else "closed"))
+        return 0
+    if not a.dry_run and tabfile.restore_running(cfg):
+        print("a restore is running; nothing closed", file=sys.stderr)
+        return 1
+
+    async def in_app(app):
+        if a.json:
+            ids = [row["session_id"] for _, _, row in await close_candidates(cfg, conn, app, a.days, only=a.only)]
+            print(json.dumps({"count": len(ids), "session_ids": ids}))
+        else:
+            await close_idle(cfg, conn, app, a.days, a.dry_run, only=a.only)
+        return 0
+    return with_app(cfg, in_app)
+
+
+# ------------------------------------------------------------------ groups, pins
+
+async def selected_session(app, conn):
+    """The session of the tab selected in the front window. Raises GroupsError when it has none."""
+    await app.async_refresh()
+    win = app.current_terminal_window
+    tab = win.current_tab if win else None
+    session = tab.current_session if tab else None
+    if session is None:
+        raise tabgroups.GroupsError("no selected iTerm2 tab")
+    pane = {"guid": session.session_id, "tty": await pane_tty(session)}
+    row = tabfile.match_panes([pane], open_rows(conn), memo_running())[pane["guid"]]
+    if not row:
+        raise tabgroups.GroupsError("the selected tab has no Claude Code session")
+    return row["session_id"]
+
+
+def named_session(conn, sid):
+    sid = cli.resolve_sid(conn, sid)
+    if not ledger.get(conn, sid):
+        raise tabgroups.GroupsError("unknown session %s" % sid)
+    return sid
+
+
+def on_session(cfg, conn, a, change):
+    """Run change(sid) -> {sid: color} to paint, on --session or the selected tab. With --session
+    the groups file changes whether or not iTerm2 runs; the selected tab needs iTerm2."""
+    up = iterm_running()
+    if a.session:
+        sid = named_session(conn, a.session)
+        colors = change(sid)
+        if colors and up:
+            async def repaint(app):
+                await paint(app, conn, colors)
+                return 0
+            return with_app(cfg, repaint)
+        return 0
+    if not up:
+        print("iTerm2 is not running; pass --session", file=sys.stderr)
+        return 1
+
+    async def in_app(app):
+        sid = await selected_session(app, conn)
+        await paint(app, conn, change(sid))
+        return 0
+    return with_app(cfg, in_app)
+
+
+def paint_after(cfg, conn, colors):
+    if not colors or not iterm_running():
+        return 0
+
+    async def in_app(app):
+        await paint(app, conn, colors)
+        return 0
+    return with_app(cfg, in_app)
+
+
+def cmd_group(cfg, conn, a):
+    if a.group_cmd == "list":
+        doc, err = tabgroups.read(cfg)
+        if err:
+            print("cc-tabs: %s" % err, file=sys.stderr)
+        items = tabgroups.listing(doc)
+        if a.json:
+            print(json.dumps(items, indent=1))
+        else:
+            for g in items:
+                print("%-24s %-8s %d" % (g["name"], g["color"] or "-", g["members"]))
+        return 0 if not err else 1
+    if a.group_cmd == "add":
+        def change(sid):
+            tabgroups.add(cfg, a.name, sid)
+            print("%s in group %s" % (sid[:8], a.name))
+            color = tabgroups.color_of(tabgroups.load(cfg), sid)
+            return {sid: color} if color else {}
+        return on_session(cfg, conn, a, change)
+    if a.group_cmd == "remove":
+        def change(sid):
+            doc = tabgroups.load(cfg)
+            had = tabgroups.color_of(doc, sid)
+            tabgroups.remove(cfg, sid)
+            print("%s in no group" % sid[:8])
+            return {sid: None} if had else {}
+        return on_session(cfg, conn, a, change)
+    if a.group_cmd == "rename":
+        tabgroups.rename(cfg, a.old, a.new)
+        print("renamed %s to %s" % (a.old, a.new))
+        return 0
+    if a.group_cmd == "delete":
+        doc = tabgroups.load(cfg)
+        colored = [s for s in tabgroups.members(doc, a.name) if tabgroups.color_of(doc, s)]
+        was = tabgroups.delete(cfg, a.name)
+        print("deleted %s; %d session(s) in no group" % (a.name, len(was)))
+        return paint_after(cfg, conn, {s: None for s in colored})
+    if a.group_cmd == "color":
+        color = tabgroups.parse_color(a.color)
+        was = tabgroups.set_color(cfg, a.name, color)
+        print("%s is %s" % (a.name, color or "uncolored"))
+        return paint_after(cfg, conn, {s: color for s in was})
+    return 2
+
+
+def cmd_pin(cfg, conn, a, pinned):
+    def change(sid):
+        if a.toggle:
+            new = tabgroups.toggle_pinned(cfg, sid)
+        else:
+            tabgroups.set_pinned(cfg, sid, pinned)
+            new = pinned
+        print("%s %s" % ("pinned" if new else "unpinned", sid[:8]))
+        return {}
+    return on_session(cfg, conn, a, change)
+
+
+def cmd_recolor(cfg, conn, a):
+    """Exit 0 with nothing done when there is nothing to color: restore starts this blind."""
+    doc, err = tabgroups.read(cfg)
+    if err:
+        print("cc-tabs: %s" % err, file=sys.stderr)
+        return 1
+    colors = group_colors(doc)
+    if not colors or not iterm_running():
+        print("recolored 0 tabs")
+        return 0
+
+    async def in_app(app):
+        print("recolored %d tabs" % await paint(app, conn, colors))
+        return 0
+    return with_app(cfg, in_app)
+
+
+# ------------------------------------------------------------------ entry point
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="cc-tabs", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("sort", help="order tabs: pinned, needs you, working, the rest, other tabs")
+    p.add_argument("--all", action="store_true", help="every window, not just the current one")
+    p.add_argument("--dry-run", "-n", action="store_true", help="print the order, move nothing")
+    p = sub.add_parser("find", help="every resumable session, newest first")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("open", help="select a session's tab, or wake it in a new one")
+    p.add_argument("session_id")
+    p = sub.add_parser("close-idle", help="close tabs of hibernated sessions idle this long")
+    p.add_argument("--days", type=float, default=7.0)
+    p.add_argument("--dry-run", "-n", action="store_true")
+    p.add_argument("--json", action="store_true", help="with --dry-run: the count and session ids")
+    p.add_argument("--only", type=parse_ids, metavar="ID,ID",
+                   help="close at most these sessions, each still passing every check")
+    p = sub.add_parser("group", help="manual groups")
+    gsub = p.add_subparsers(dest="group_cmd")
+    g = gsub.add_parser("add")
+    g.add_argument("name")
+    g.add_argument("--session")
+    g = gsub.add_parser("remove")
+    g.add_argument("--session")
+    g = gsub.add_parser("rename")
+    g.add_argument("old")
+    g.add_argument("new")
+    g = gsub.add_parser("delete")
+    g.add_argument("name")
+    g = gsub.add_parser("color")
+    g.add_argument("name")
+    g.add_argument("color", help="#rrggbb or none")
+    g = gsub.add_parser("list")
+    g.add_argument("--json", action="store_true")
+    p = sub.add_parser("pin", help="keep a tab at the front of a sort")
+    p.add_argument("--session")
+    p.add_argument("--toggle", action="store_true", help="unpin when already pinned")
+    p = sub.add_parser("unpin")
+    p.add_argument("--session")
+    p.set_defaults(toggle=False)
+    sub.add_parser("recolor", help="reapply group colors to open tabs")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    a = ap.parse_args(argv)
+    if not a.cmd or (a.cmd == "group" and not a.group_cmd):
+        ap.print_help()
+        return 2
+    cfg = config.load()
+    # before anything changes: the re-exec replays the whole command, and a replayed
+    # `group delete` or `pin --toggle` would do it twice
+    if a.cmd != "find" and not (a.cmd == "group" and a.group_cmd == "list") and iterm_running():
+        need_iterm2(cfg)
+    conn = ledger.connect(cfg.path("db"))
+    try:
+        if a.cmd == "group":
+            return cmd_group(cfg, conn, a)
+        if a.cmd == "pin":
+            return cmd_pin(cfg, conn, a, True)
+        if a.cmd == "unpin":
+            return cmd_pin(cfg, conn, a, False)
+        return {"sort": cmd_sort, "find": cmd_find, "open": cmd_open, "close-idle": cmd_close_idle,
+                "recolor": cmd_recolor}[a.cmd](cfg, conn, a)
+    except tabgroups.GroupsError as exc:
+        print("cc-tabs: %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

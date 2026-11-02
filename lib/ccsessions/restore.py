@@ -40,6 +40,12 @@ INSTANCE_END_MARGIN_S = 60
 STILL_RUNNING = "already running"
 STILL_OPEN = "tab still open"
 QUIET_SKIPS = (STILL_RUNNING, STILL_OPEN)
+# the login agent runs once: what is still dying when it fires gets this long to finish
+LOGIN_RETRY_S = 15
+LOGIN_RETRY_MAX_S = 180
+# A chosen restart can sit in its quit phase past the daemon's alone check (another app's save
+# sheet holds the logout), so a marker written this soon before boot was that shutdown.
+ENDED_ALONE_BOOT_GRACE_S = 600
 
 
 def rebuildable_worktree(cfg, cwd, isdir=os.path.isdir):
@@ -337,9 +343,85 @@ def bind_opened(conn, plan, opened, out=print):
     return bound
 
 
-def run_snapshot(cfg, conn, auto=False, dry_run=False, snapshot=None, out=print):
-    """The snapshot path of `restore`, holding the restore lock for the whole run. A
-    dry run opens nothing and takes no lock, so a preview can never make a real run lose."""
+def _select(cfg, conn, snap, current, entries, guids):
+    from .ledger import all_rows
+    alive = lambda r: procs.identity_alive(r.get("pid"), r.get("pid_start"))
+    return select_snapshot(snap, all_rows(conn), cfg, alive, guids,
+                           until=tabfile.next_instance_start(cfg, snap, current, entries),
+                           unsure_fn=identity_unsure)
+
+
+def went_down_alone(path):
+    """True when --auto must leave this snapshot for a click. A marker from a shutdown's quit
+    phase does not count, and an unreadable boot time means restoring."""
+    if not tabfile.flagged(path, tabfile.ENDED_ALONE_SUFFIX):
+        return False
+    boot = procs.boot_time()
+    if not boot:
+        return False
+    try:
+        marked = os.path.getmtime(path + tabfile.ENDED_ALONE_SUFFIX)
+    except OSError:
+        return False
+    return not 0 <= boot - marked <= ENDED_ALONE_BOOT_GRACE_S
+
+
+def login_settled(cfg, conn):
+    """False while --auto should wait: iTerm2 does not answer, or a session of the snapshot
+    it would restore still has a process and no tab (possibly still dying)."""
+    current = tabfile.iterm_instance()
+    entries = tabfile.list_snapshots(cfg)
+    entry = tabfile.previous(cfg, current, entries)
+    if entry is None or tabfile.consumed(entry["path"]) or tabfile.flagged(entry["path"], tabfile.DISMISSED_SUFFIX) \
+            or went_down_alone(entry["path"]):
+        return True
+    guids = live_guids_of(current)
+    if guids is None:
+        return False
+    return not any(why == STILL_RUNNING for _, why in _select(cfg, conn, entry["snap"], current, entries, guids)[2])
+
+
+def wait_for_login(cfg, conn, sleep, clock, out=print):
+    """Holds no lock, so a menu click during the wait is not blocked; the run that follows
+    re-reads everything, and that click's tabs are then skipped."""
+    start = clock()
+    while not login_settled(cfg, conn):
+        left = LOGIN_RETRY_MAX_S - (clock() - start)
+        if left <= 0:
+            out("  not settled after %ds; going on" % LOGIN_RETRY_MAX_S)
+            return
+        sleep(min(LOGIN_RETRY_S, left))
+
+
+def spawn_recolor(out=print):
+    """Group colors on the tabs a restore just opened. A failure here never fails a restore."""
+    try:
+        subprocess.Popen([resumecmd.bin_path("cc-tabs"), "recolor"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception as exc:
+        out("  could not recolor tabs: %s" % exc)
+
+
+def dismiss(cfg, out=print):
+    """Wave off the newest previous snapshot: nothing pending, plain restore and --auto leave
+    it alone, --snapshot PATH still opens it."""
+    entry = tabfile.previous(cfg, tabfile.iterm_instance())
+    if entry is None:
+        out("nothing to dismiss")
+        return 0
+    tabfile.set_flag(entry["path"], tabfile.DISMISSED_SUFFIX)
+    out("dismissed the snapshot from %s" % tabfile.when(entry["snap"]["taken_at"]))
+    return 0
+
+
+def run_snapshot(cfg, conn, auto=False, dry_run=False, snapshot=None, out=print, sleep=None,
+                 clock=time.monotonic, after_open=None):
+    """The snapshot path of `restore`, holding the restore lock while it opens. A dry run
+    opens nothing and takes no lock, so a preview can never make a real run lose. `sleep` turns
+    on --auto's login wait and `after_open` runs once tabs opened: the CLI passes both, so a
+    caller that passes neither neither waits nor starts anything."""
+    if auto and not dry_run and not snapshot and sleep is not None:
+        wait_for_login(cfg, conn, sleep, clock, out)
     lock = None
     if not dry_run:
         lock = tabfile.restore_lock(cfg)
@@ -347,7 +429,7 @@ def run_snapshot(cfg, conn, auto=False, dry_run=False, snapshot=None, out=print)
             out("restore already running")
             return 0
     try:
-        return _run_snapshot(cfg, conn, auto, dry_run, snapshot, out)
+        return _run_snapshot(cfg, conn, auto, dry_run, snapshot, out, after_open)
     finally:
         if lock is not None:
             lock.close()
@@ -360,8 +442,7 @@ def live_guids_of(current):
     return set() if current is None else iterm_guids()
 
 
-def _run_snapshot(cfg, conn, auto, dry_run, snapshot, out):
-    from .ledger import all_rows
+def _run_snapshot(cfg, conn, auto, dry_run, snapshot, out, after_open=None):
     current = tabfile.iterm_instance()
     entries = tabfile.list_snapshots(cfg)
     if snapshot:
@@ -375,6 +456,12 @@ def _run_snapshot(cfg, conn, auto, dry_run, snapshot, out):
             out("nothing to restore")
             return 0
     path, snap = entry["path"], entry["snap"]
+    if not snapshot and tabfile.flagged(path, tabfile.DISMISSED_SUFFIX):
+        out("nothing to restore")
+        return 0
+    if auto and not snapshot and went_down_alone(path):
+        out("auto: iTerm2 went down alone in %s; that restores on a click, not at login" % os.path.basename(path))
+        return 0
     if auto and not dry_run and tabfile.consumed(path):
         out("auto: %s was already restored" % os.path.basename(path))
         out("nothing to restore")
@@ -384,18 +471,15 @@ def _run_snapshot(cfg, conn, auto, dry_run, snapshot, out):
         # never open blind, and an --auto abort must not consume the snapshot
         out("iTerm2 could not be asked; retry")
         return 1
-    alive = lambda r: procs.identity_alive(r.get("pid"), r.get("pid_start"))
-    runs, typed, skipped, non_claude = select_snapshot(
-        snap, all_rows(conn), cfg, alive, guids,
-        until=tabfile.next_instance_start(cfg, snap, current, entries), unsure_fn=identity_unsure)
+    runs, typed, skipped, non_claude = _select(cfg, conn, snap, current, entries, guids)
     for r, why in skipped:
         if why not in QUIET_SKIPS:
             out("  skip %s: %s" % (r["session_id"][:8], why))
     if non_claude:
         out("  %d pane(s) without a session are not reopened" % len(non_claude))
     # STILL_RUNNING = alive with no live tab: possibly a process still dying when the login
-    # agent fired, so the snapshot stays unconsumed for it. Nothing retries by itself; the
-    # next --auto (the next load of the agent) or a manual run from the menu picks it up.
+    # agent fired, so the snapshot stays unconsumed for it. wait_for_login gave it time; after
+    # that the next --auto (the next load of the agent) or a manual run from the menu picks it up.
     dying = sum(1 for _, why in skipped if why == STILL_RUNNING)
     consume = auto and not dry_run and not dying
     if auto and not dry_run and dying:
@@ -429,6 +513,11 @@ def _run_snapshot(cfg, conn, auto, dry_run, snapshot, out):
             except Exception as exc:
                 out("  could not select the first tab: %s" % exc)
         bind_opened(conn, plan, progress["opened"], out)
+    if progress["opened"] and after_open is not None:
+        try:
+            after_open()
+        except Exception as exc:
+            out("  after-open step failed: %s" % exc)
     opened_plan = plan[:len(progress["opened"])]
     n_run = sum(1 for _, run_it in opened_plan if run_it)
     if error:
@@ -491,10 +580,12 @@ def iterm_guids():
     # every shell in an iTerm2 tab
     if subprocess.run(["pgrep", "-axq", "iTerm2"]).returncode != 0:
         return None
-    script = ('tell application "iTerm2"\nset o to ""\nrepeat with w in windows\n'
+    # `is running`: a bare tell launches iTerm2 if it exited just after the pgrep
+    script = ('if application "iTerm2" is running then\n'
+              'tell application "iTerm2"\nset o to ""\nrepeat with w in windows\n'
               'repeat with t in tabs of w\nrepeat with s in sessions of t\n'
               'set o to o & (id of s) & linefeed\nend repeat\nend repeat\nend repeat\n'
-              'return o\nend tell')
+              'return o\nend tell\nend if')
     try:
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
     except subprocess.SubprocessError:
@@ -505,9 +596,10 @@ def iterm_guids():
 
 
 def run(cfg, conn, auto=False, dry_run=False, limit=None, include_hibernated=False, out=print,
-        max_age_days=None, snapshot=None):
+        max_age_days=None, snapshot=None, sleep=None, after_open=None):
     if snapshot or tabfile.list_snapshots(cfg):
-        return run_snapshot(cfg, conn, auto=auto, dry_run=dry_run, snapshot=snapshot, out=out)
+        return run_snapshot(cfg, conn, auto=auto, dry_run=dry_run, snapshot=snapshot, out=out,
+                            sleep=sleep, after_open=after_open)
     from .ledger import all_rows
     limit = limit or int(cfg.get("restore_limit", 40))
     boot = procs.boot_time()

@@ -239,23 +239,36 @@ def cmd_holds(cfg, a):
 
 def cmd_restore(cfg, a):
     from . import restore
+    if a.dismiss:
+        return restore.dismiss(cfg)
     conn = _open(cfg)
     return restore.run(cfg, conn, auto=a.auto, dry_run=a.dry_run, limit=a.limit,
                        include_hibernated=a.include_hibernated, max_age_days=a.max_age_days,
-                       snapshot=a.snapshot)
+                       snapshot=a.snapshot, sleep=time.sleep, after_open=restore.spawn_recolor)
 
 
-def tabs_data(cfg, conn):
+def tabs_data(cfg, conn, ask=True, idle_days=None):
     """What `cc-sessions tabs` reports. `pending` (what restore would open now) is computed
     for the newest previous snapshot only; pending_known is false when a running iTerm2
-    could not be asked, which also keeps null out of what the menu has to decode."""
-    from . import ledger, procs, restore, tabs
+    could not be asked, which also keeps null out of what the menu has to decode. Never a
+    cookie or the API: the live tab list is one AppleScript call, shared by both numbers, and
+    ask=False skips it (AppleScript to iTerm2 is what raises the Automation prompt)."""
+    from . import activity, ledger, procs, restore, tabgroups, tabs
     current = tabs.iterm_instance()
+    asked = []
+
+    def live_guids():
+        if not asked:
+            asked.append(restore.live_guids_of(current) if ask or current is None else None)
+        return asked[0]
     entries = tabs.list_snapshots(cfg)
     prev = tabs.previous(cfg, current, entries)
     pending = None
-    if prev is not None:
-        guids = restore.live_guids_of(current)
+    dismissed = prev is not None and tabs.flagged(prev["path"], tabs.DISMISSED_SUFFIX)
+    if dismissed:
+        pending = 0
+    elif prev is not None:
+        guids = live_guids()
         if guids is not None:
             alive = lambda r: procs.identity_alive(r.get("pid"), r.get("pid_start"))
             run, typed, _, _ = restore.select_snapshot(
@@ -273,15 +286,22 @@ def tabs_data(cfg, conn):
         if e is prev and pending is not None:
             d["pending"] = pending
         snapshots.append(d)
-    return {"restoring": tabs.restore_running(cfg), "pending": pending or 0,
-            "pending_known": prev is None or pending is not None,
-            "pending_path": prev["path"] if prev else "",
-            "pending_time": tabs.when(prev["snap"]["taken_at"]) if prev else "",
-            "snapshots": snapshots}
+    out = {"restoring": tabs.restore_running(cfg), "pending": pending or 0,
+           "pending_known": prev is None or pending is not None,
+           "pending_dismissed": dismissed,
+           "pending_path": prev["path"] if prev else "",
+           "pending_time": tabs.when(prev["snap"]["taken_at"]) if prev else "",
+           "snapshots": snapshots}
+    if idle_days is not None:
+        doc, err = tabgroups.read(cfg)  # close-idle closes nothing on an unreadable file
+        idle = 0 if err else activity.idle_estimate(conn, doc, idle_days, time.time(), live_guids)
+        out["idle_tabs"] = idle or 0
+        out["idle_tabs_known"] = idle is not None
+    return out
 
 
 def cmd_tabs(cfg, a):
-    d = tabs_data(cfg, _open(cfg))
+    d = tabs_data(cfg, _open(cfg), ask=not a.no_ask, idle_days=a.idle_days)
     if a.json:
         print(json.dumps(d, indent=1))
         return 0
@@ -584,8 +604,12 @@ def build_parser():
     p.add_argument("--max-age-days", type=int, metavar="N",
                    help="override restore_max_age_days (0 = no limit)")
     p.add_argument("--snapshot", metavar="PATH", help="restore this snapshot file (see `tabs`)")
+    p.add_argument("--dismiss", action="store_true", help="wave off the newest previous snapshot")
     p = sub.add_parser("tabs", help="tab snapshots, and what restore would open now")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--idle-days", type=float, metavar="N",
+                   help="also estimate how many tabs `cc-tabs close-idle --days N` would close")
+    p.add_argument("--no-ask", action="store_true", help="send no AppleScript to iTerm2")
     p = sub.add_parser("import-legacy", help="one-time import of v1 manifests + live registry")
     p.add_argument("--manifests")
     p.add_argument("--registry")

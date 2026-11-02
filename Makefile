@@ -5,18 +5,19 @@ LOG_DIR       ?= $(HOME)/Library/Logs
 DAEMON_PYTHON ?= $(HOME)/.claude/venvs/iterm2/bin/python
 PYTHON        ?= /usr/bin/python3
 
-BIN_FILES  = cc-sessions cc-resume
+BIN_FILES  = cc-sessions cc-resume cc-tabs
 LIB_FILES  = $(notdir $(wildcard lib/ccsessions/*.py))
 LIBDIR     = $(PREFIX)/lib/cc-sessions
 PLIST      = com.cc-sessions.daemon.plist
 HAMMERSPOON ?= $(HOME)/.hammerspoon
 MENU_LUA   = cc_sessions_menu.lua
 
-.PHONY: install uninstall check test release-check render-plist
+.PHONY: install uninstall check test release-check render-plist render-shim
 
-install: render-plist
+install: render-plist render-shim
 	mkdir -p $(PREFIX)/bin $(LIBDIR)/ccsessions $(LAUNCHAGENTS)
 	for f in $(BIN_FILES); do install -m 755 bin/$$f $(PREFIX)/bin/$$f; done
+	install -m 755 build/cc-tabsort $(PREFIX)/bin/cc-tabsort
 	@# __init__.py (SCHEMA_VERSION) last: a hook that runs mid-install must never see the new
 	@# schema version with the old ledger code (it would answer "unknown" and release claims)
 	for f in $(filter-out __init__.py,$(LIB_FILES)) __init__.py; do install -m 644 lib/ccsessions/$$f $(LIBDIR)/ccsessions/$$f; done
@@ -34,15 +35,22 @@ render-plist:
 	    -e 's|@DAEMON_SCRIPT@|$(LIBDIR)/cc_sessions_daemon.py|g' \
 	    -e 's|@LOG_DIR@|$(LOG_DIR)|g' launchd/$(PLIST).in > build/$(PLIST)
 
+# `cc-tabsort` used to be its own script: same name, now one line in front of `cc-tabs sort`
+render-shim:
+	mkdir -p build
+	printf '#!/bin/sh\nexec "$(PREFIX)/bin/cc-tabs" sort "$$@"\n' > build/cc-tabsort
+
 uninstall:
 	for f in $(BIN_FILES); do rm -f $(PREFIX)/bin/$$f; done
+	rm -f $(PREFIX)/bin/cc-tabsort
 	rm -rf $(LIBDIR)
 	rm -f $(LAUNCHAGENTS)/$(PLIST)
 
 # exit 1 when any installed file differs from the repo
-check: render-plist
+check: render-plist render-shim
 	@rc=0; \
 	for f in $(BIN_FILES); do cmp -s bin/$$f $(PREFIX)/bin/$$f || { echo "differs: $(PREFIX)/bin/$$f"; rc=1; }; done; \
+	cmp -s build/cc-tabsort $(PREFIX)/bin/cc-tabsort || { echo "differs: $(PREFIX)/bin/cc-tabsort"; rc=1; }; \
 	for f in $(LIB_FILES); do cmp -s lib/ccsessions/$$f $(LIBDIR)/ccsessions/$$f || { echo "differs: $(LIBDIR)/ccsessions/$$f"; rc=1; }; done; \
 	cmp -s daemon/cc_sessions_daemon.py $(LIBDIR)/cc_sessions_daemon.py || { echo "differs: $(LIBDIR)/cc_sessions_daemon.py"; rc=1; }; \
 	cmp -s build/$(PLIST) $(LAUNCHAGENTS)/$(PLIST) || { echo "differs: $(LAUNCHAGENTS)/$(PLIST)"; rc=1; }; \

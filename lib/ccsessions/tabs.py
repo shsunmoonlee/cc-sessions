@@ -6,8 +6,11 @@ that file instead of inferring what was open from process ends. A plain file on 
 survives a damaged ledger and needs no schema change.
 
 A file holds {"v", "iterm_pid", "iterm_start", "taken_at", "windows": [{"window_id", "tabs":
-[{"tab_id", "sessions": [{"guid", "tty", "session_id", "state", "title", "cwd"}]}]}]}, with
-session_id null for a pane that runs no Claude Code session.
+[{"tab_id", "sessions": [{"guid", "tty", "session_id", "state", "title", "cwd"}]}]}],
+"gui_session": {"loginwindow": {"pid", "start"}, "WindowServer": {"pid", "start"}}}, with
+session_id null for a pane that runs no Claude Code session. Marker files sit beside a
+snapshot: .restored (--auto consumed it), .ended_alone (its iTerm2 went down while the GUI
+session lived on: restored on a click, not at login), .dismissed (the owner waved it off).
 """
 import fcntl
 import json
@@ -31,6 +34,10 @@ LOCK_TRIES = 3
 LOCK_RETRY_S = 0.05
 SNAP_RE = re.compile(r"^\d+-\d+(\.before-shrink-\d+)?\.json$")
 MARKER_SUFFIX = ".restored"
+ENDED_ALONE_SUFFIX = ".ended_alone"
+DISMISSED_SUFFIX = ".dismissed"
+MARKER_SUFFIXES = (MARKER_SUFFIX, ENDED_ALONE_SUFFIX, DISMISSED_SUFFIX)
+GUI_PROCESSES = ("loginwindow", "WindowServer")
 
 
 def snapshots_dir(cfg):
@@ -39,15 +46,14 @@ def snapshots_dir(cfg):
     return cfg.path("tab_snapshots_dir") or os.path.join(config.db_dir(cfg), "cc-sessions-tabs")
 
 
-def iterm_instance():
-    """{"pid", "start"} of the running iTerm2, None when not running. Two pids (a hung old
-    one and its replacement): the newest start wins."""
+def _processes(name):
+    """[(start, pid)] of every process with exactly this name."""
     # -a: macOS pgrep skips its own ancestors by default, and iTerm2 is an ancestor of
     # every shell in an iTerm2 tab
     try:
-        r = subprocess.run(["pgrep", "-ax", "iTerm2"], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["pgrep", "-ax", name], capture_output=True, text=True, timeout=10)
     except (subprocess.SubprocessError, OSError):
-        return None
+        return []
     found = []
     for word in r.stdout.split():
         try:
@@ -57,6 +63,26 @@ def iterm_instance():
             continue
         if ent:
             found.append((int(ent[0]), pid))
+    return found
+
+
+def gui_session():
+    """{name: {"pid", "start"}} for the processes that restart with the GUI session; None when
+    any cannot be read, which callers must treat as "cannot tell"."""
+    out = {}
+    for name in GUI_PROCESSES:
+        found = _processes(name)
+        if not found:
+            return None
+        start, pid = max(found)
+        out[name] = {"pid": pid, "start": start}
+    return out
+
+
+def iterm_instance():
+    """{"pid", "start"} of the running iTerm2, None when not running. Two pids (a hung old
+    one and its replacement): the newest start wins."""
+    found = _processes("iTerm2")
     if not found:
         return None
     if len(found) > 1:
@@ -84,7 +110,22 @@ def session_index(rows):
     return live, parked
 
 
-def build_snapshot(instance, windows, rows, now=None):
+def pane_row(pane, live, parked):
+    """The session of one pane, from session_index's two maps: the live row on its tty; only
+    when none holds that tty, a parked row bound to its GUID."""
+    return live.get(pane.get("tty")) or parked.get(pane["guid"])
+
+
+def match_panes(panes, rows, running):
+    """{guid: row or None} for a tool that acts on a tab. A live row counts only when
+    running(row): after a crash a dead row still names a tty some other tab holds now, so a
+    tty alone proves nothing. A running process on that tty does, and it is all there is: a
+    live row's iterm_guid is NULL until its tab is first seen, and stale after that."""
+    live, parked = session_index([r for r in rows if r.get("state") not in LIVE_STATES or running(r)])
+    return {p["guid"]: pane_row(p, live, parked) for p in panes}
+
+
+def build_snapshot(instance, windows, rows, now=None, gui=None):
     """windows: [{"window_id", "tabs": [{"tab_id", "sessions": [{"guid", "tty"}]}]}].
     A pane's session is the live row on its tty; only when none holds that tty, a parked row
     bound to its guid. Guid first would lose a live session: a hibernated row keeps a stale
@@ -96,13 +137,16 @@ def build_snapshot(instance, windows, rows, now=None):
         for t in w["tabs"]:
             panes = []
             for p in t["sessions"]:
-                r = live.get(p.get("tty")) or parked.get(p["guid"]) or {}
+                r = pane_row(p, live, parked) or {}
                 panes.append({"guid": p["guid"], "tty": p.get("tty"), "session_id": r.get("session_id"),
                               "state": r.get("state"), "title": r.get("title"), "cwd": r.get("cwd")})
             tabs.append({"tab_id": t["tab_id"], "sessions": panes})
         out.append({"window_id": w["window_id"], "tabs": tabs})
-    return {"v": VERSION, "iterm_pid": instance["pid"], "iterm_start": instance["start"],
+    snap = {"v": VERSION, "iterm_pid": instance["pid"], "iterm_start": instance["start"],
             "taken_at": time.time() if now is None else now, "windows": out}
+    if gui:
+        snap["gui_session"] = gui
+    return snap
 
 
 def tab_count(snap):
@@ -162,7 +206,11 @@ def read_snapshot(path):
 
 
 def _content(snap):
-    return {k: v for k, v in snap.items() if k != "taken_at"}
+    return {k: v for k, v in snap.items() if k not in ("taken_at", "gui_session")}
+
+
+def snapshot_path(cfg, instance):
+    return os.path.join(snapshots_dir(cfg), "%d-%d.json" % (instance["start"], instance["pid"]))
 
 
 def write_snapshot(cfg, snap):
@@ -177,7 +225,8 @@ def write_snapshot(cfg, snap):
     path = os.path.join(d, stem + ".json")
     old = read_snapshot(path)
     if old is not None:
-        if _content(old) == _content(snap):
+        # a file an older daemon wrote gets the field once, or it would never have it
+        if _content(old) == _content(snap) and (old.get("gui_session") or not snap.get("gui_session")):
             return "unchanged"
         if tab_count(snap) < tab_count(old) * SHRINK_KEEP_RATIO:
             with open(path, "rb") as fh:
@@ -219,8 +268,9 @@ def prune(cfg, keep=KEEP_FILES, now=None):
         _unlink(os.path.join(d, n))
     kept = {n for _, n in snaps[:keep]}
     for n in names:
-        if n.endswith(MARKER_SUFFIX) and n[:-len(MARKER_SUFFIX)] not in kept:
-            _unlink(os.path.join(d, n))
+        for suffix in MARKER_SUFFIXES:
+            if n.endswith(suffix) and n[:-len(suffix)] not in kept:
+                _unlink(os.path.join(d, n))
 
 
 def load_entry(path):
@@ -277,6 +327,14 @@ def consumed(path):
 
 def mark_consumed(path):
     atomic_write(marker_path(path), ("%s\n" % time.time()).encode("ascii"))
+
+
+def flagged(path, suffix):
+    return os.path.exists(path + suffix)
+
+
+def set_flag(path, suffix):
+    atomic_write(path + suffix, ("%s\n" % time.time()).encode("ascii"))
 
 
 def lock_path(cfg):

@@ -55,6 +55,11 @@ DEFAULTS = {
     "bootmark": "~/.cache/cc-sessions.bootmark",
     # null = cc-sessions-tabs beside the ledger (~/.claude/state/cc-sessions-tabs by default)
     "tab_snapshots_dir": None,
+    # after losing iTerm2, how long the daemon waits before deciding it went down alone: a
+    # logout or restart stops launchd agents within this, so no marker gets written
+    "iterm_alone_check_s": 30,
+    # null = cc-sessions-groups.json beside the ledger
+    "groups_file": None,
     # What gets typed into a tab to resume a session. null = the cc-resume installed
     # next to this package (bin/cc-resume).
     "resume_command": None,
@@ -71,7 +76,7 @@ DEFAULTS = {
 
 PATH_KEYS = ("db", "daemon_python", "claude_projects", "claude_sessions", "claude_settings",
              "claude_tmp", "log", "sock_dir", "bootmark", "legacy_manifests", "launchd_plist",
-             "on_evict", "tab_snapshots_dir")
+             "on_evict", "tab_snapshots_dir", "groups_file")
 
 
 def expand(p):

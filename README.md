@@ -6,6 +6,8 @@ Session bookkeeping for [Claude Code](https://code.claude.com) on macOS + iTerm2
 - a **daemon** that frees memory under pressure by hibernating the least recently used idle
   sessions (graceful SIGTERM, recorded first) and resumes one when you click its tab;
 - **restore** after a crash, power loss or shutdown;
+- **tab tools** for the tabs themselves: sort on demand, a session picker, closing old tabs on a
+  click, manual groups and pins (see [Tabs](#tabs));
 - **holds**, so a worktree cleaner can ask "does any session still need this directory?".
 
 Formerly `cc-restore`. See [Migrating from v1](#migrating-from-v1).
@@ -131,7 +133,7 @@ cc-sessions hibernate <sid>|--all-idle   ask the daemon (explicit: skips pressur
 cc-sessions wake <sid>|--all         resume in the original tab, or a new tab if it is gone
 cc-sessions pending <transcript>     {"pending": [...], "last_text": "..."}; unreadable = pending
 cc-sessions holds <path> [-v]        exit 0 held, 1 free, 2 ledger unreadable (treat != 1 as held)
-cc-sessions restore [--auto] [--dry-run] [--snapshot PATH] [--limit N] [--include-hibernated] [--max-age-days N]
+cc-sessions restore [--auto] [--dry-run] [--dismiss] [--snapshot PATH] [--limit N] [--include-hibernated] [--max-age-days N]
 cc-sessions tabs [--json]            tab snapshots, and what restore would open now
 cc-sessions import-legacy [--manifests DIR] [--registry DIR]
 cc-sessions doctor                   PASS/FAIL checks, exit 1 on any FAIL
@@ -139,7 +141,62 @@ cc-sessions reap [--dry-run]         delete dead-pid sockets; list (never kill) 
 cc-sessions daemon [--once] [--dry-run]   run the daemon in the foreground; --once prints
                                           the candidate table with keep reasons and exits
 cc-resume <sid> [--cwd DIR] [--dry-run]   resume a session, unparking its worktree if needed
+cc-tabs sort [--all] [--dry-run]     order tabs, see below; cc-tabsort is the same command
+cc-tabs find [--json]                every resumable session, newest first
+cc-tabs open <sid>                   select its tab, or wake it in a new one
+cc-tabs close-idle [--days 7] [--dry-run] [--json] [--only ID,ID]
+cc-tabs group add <name> [--session ID] | remove [--session ID] | rename <old> <new>
+cc-tabs group delete <name> | color <name> <#rrggbb|none> | list [--json]
+cc-tabs pin [--session ID] [--toggle] | unpin [--session ID]
+cc-tabs recolor                      reapply group colors to open tabs
 ```
+
+### Tabs
+
+Nothing moves or closes a tab unless you ask. No background sort, no automatic close, and no
+automatic grouping: group names, members and colors are yours. Commands default to the tab
+selected in the front iTerm2 window. `contrib/hammerspoon/cc_sessions_menu.lua` is the menu bar
+item for all of this (`cc ⟲N` when N sessions are pending). `make install` copies it to
+`~/.hammerspoon/` when that exists; require it in a pcall from `init.lua` and call `start()`. The
+first use of the menu may ask for an Automation grant (Hammerspoon to iTerm2); until then its
+refresh sends iTerm2 nothing, so a pending count shows only once iTerm2 is not running or the menu
+has been opened. The refresh never connects to iTerm2's API.
+
+**Restore.** After a Mac crash, a WindowServer crash or a restart you chose, the login agent
+(`restore --auto`) reopens your tabs by itself. After iTerm2 went down alone (a clean quit, an
+update, an iTerm2-only crash) they wait for a click: on losing iTerm2 the daemon waits
+`iterm_alone_check_s`, and if `loginwindow` and `WindowServer` are the same processes as when the
+snapshot was written, it marks the snapshot `.ended_alone`. A logout stops the daemon during that
+wait, and a crash changes those processes, so neither is marked; anything it cannot read means no
+marker, which means restoring. A marker written less than 10 minutes before the current boot is
+ignored, since that was a restart whose quit phase outlasted the wait (another app's save sheet);
+an unreadable boot time also means restoring. `--auto` waits up to 3 minutes for sessions still shutting down
+and for an iTerm2 that does not answer yet, without holding up a click. `restore --dismiss` (menu:
+`Dismiss`) waves off the pending snapshot; `--snapshot PATH` still opens it.
+
+**Sort** (`cc-tabs sort`, menu or ⌃⌥⌘S): pinned; needs you (waiting on a prompt); working (anything
+hibernation refuses to touch because work is in flight: busy, subagents, background shells and
+monitors, a working child process); the rest, hibernated and idle mixed, where a group and an
+ungrouped session rank alike by newest activity and a group's members sit together; other tabs
+last, as they were. Activity is the newest prompt, turn end or finished subagent, else the
+session's start or resume. A pinned, waiting or working tab stays in that section even when
+grouped. It does not change the selected tab, so it wakes nothing. `--all` sorts every window.
+
+**Find** (`Find session`, ⌃⌥⌘F): search by title, group or folder. Enter selects the tab, which
+wakes a hibernated session, or wakes it in a new tab if its tab is gone.
+
+**Close** (`Close about N tabs idle over 7 days`, always with a confirmation): the menu's number is
+an estimate, the confirmation names an exact dry run, and the close takes at most those sessions,
+refusing while a restore runs. A tab closes only when its
+session is hibernated, its process is gone, it has been idle over `--days`, it is not pinned or in
+a group, its foreground job is a shell, it is not a split tab and it is not the selected tab of a
+window. An unreadable groups file closes nothing. The session stays hibernated, so Find and
+`cc-sessions wake` still reach it. If a close drops more than half the tabs, the snapshot from
+just before it is kept and `Older snapshots` undoes it; a smaller close keeps no such copy.
+
+**Groups and pins** live in `cc-sessions-groups.json` beside the ledger (`groups_file`). A group has
+no color until you give it one. Colors go on each session's own copy of its profile, so the shared
+profile is untouched.
 
 ### restore
 
@@ -171,11 +228,6 @@ write that more than halves the tab count first keeps the old file as
 
 Window order in the file is iTerm2's creation order, not screen order.
 
-`contrib/hammerspoon/cc_sessions_menu.lua` is a menu bar item for this (`cc ⟲N` when N
-sessions are pending): restore, preview, older snapshots, the log. `make install` copies it to
-`~/.hammerspoon/` when that exists; require it in a pcall from `init.lua` and call `start()`.
-The first restore from it may ask for an Automation grant (Hammerspoon to iTerm2).
-
 On a machine with no snapshot yet, the legacy path restores sessions whose process is gone but
 whose SessionEnd never arrived (crash, power loss), plus the shutdown cluster: sessions that ended with reason `other` together, right
 before boot. A deliberate exit is never restored. `--auto` (for a login launchd job) runs at
@@ -202,6 +254,8 @@ path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file tha
 |---|---|---|
 | `db` | `~/.claude/state/cc-sessions.db` | the ledger |
 | `tab_snapshots_dir` | `cc-sessions-tabs` beside the ledger | tab snapshots (`~/.claude/state/cc-sessions-tabs` with the default ledger) |
+| `iterm_alone_check_s` | 30 | after losing iTerm2, how long before deciding it went down alone |
+| `groups_file` | `cc-sessions-groups.json` beside the ledger | manual groups and pins |
 | `low_free_pct` / `high_free_pct` | 20 / 35 | evict below, stop at |
 | `swap_high_pct` | 75 | swap used % that counts as memory pressure (0 = off) |
 | `idle_min` | 10 | minutes idle, unfocused and without file activity |

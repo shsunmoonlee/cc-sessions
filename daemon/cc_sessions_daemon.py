@@ -45,8 +45,8 @@ _LIB = _libdir()
 if _LIB and _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 
-from ccsessions import (BUSY, EVICTING, HIBERNATED, IDLE, LIVE_STATES,  # noqa: E402
-                        PARKED_STATES, RESUMING, config, ledger, pending, procs, resumecmd)
+from ccsessions import (EVICTING, HIBERNATED, IDLE, LIVE_STATES,  # noqa: E402
+                        PARKED_STATES, RESUMING, activity, config, ledger, pending, procs, resumecmd)
 from ccsessions import tabs as tab_snapshots  # noqa: E402
 
 log = logging.getLogger("cc-sessions")
@@ -92,28 +92,8 @@ def _pct(v):
     return "?" if v is None else "%s%%" % v
 
 
-def _as_analysis(v):
-    if isinstance(v, dict):
-        return v
-    return {"pending": list(v or []), "has_user": True}
-
-
-def _projects(cfg):
-    if hasattr(cfg, "path"):
-        return cfg.path("claude_projects")
-    return config.expand(cfg.get("claude_projects"))
-
-
-def row_transcript(row, cfg):
-    """The row's transcript file (ledger.resolve_transcript), or None. When the resolver
-    finds a different file than the recorded one, row["transcript"] is replaced in this
-    dict; the event loop writes it back to the ledger (heal_transcripts)."""
-    rec = row.get("transcript")
-    tr = ledger.resolve_transcript(_projects(cfg), row.get("session_id"), rec,
-                                   stale_s=float(cfg.get("idle_min") or 10) * 60)
-    if tr and tr != rec:
-        row["transcript"] = tr
-    return tr
+_as_analysis = activity.as_analysis
+row_transcript = activity.row_transcript
 
 
 def heal_transcripts(conn, rows, before):
@@ -204,15 +184,14 @@ def guard_reason(row, now, cfg, focus_state, pending_fn, children_fn, identity_f
         return "a hook failed to record (marker)"
     st = row.get("state")
     in_state = now - (row.get("state_since") or now)
-    stale_busy = False
-    if st == BUSY and in_state > float(cfg["stale_busy_min"]) * 60:
-        stale_busy = True  # confirmed below from the transcript (Esc-interrupt, no Stop)
-    elif st != IDLE:
+    stale_busy = activity.stale_busy(row, now, cfg)  # confirmed below from the transcript
+    if not stale_busy and st != IDLE:
         return "state=%s" % st
     if not explicit and not stale_busy and in_state < idle_s_min:
         return "idle %dm" % _mins(in_state)
-    if (row.get("subagents") or 0) > 0:
-        return "subagents=%d" % row["subagents"]
+    why = activity.subagent_reason(row)
+    if why:
+        return why
     tty = row.get("tty")
     if not tty or tty not in (focus_state.get("tty_guid") or {}):
         return "no iTerm2 tab for %s" % (tty or "no tty")
@@ -246,14 +225,7 @@ def guard_reason(row, now, cfg, focus_state, pending_fn, children_fn, identity_f
     a = _as_analysis(pending_fn(row))
     if not a.get("has_user"):
         return "no user message"
-    if a.get("pending"):
-        return "pending: " + ", ".join(a["pending"])[:60]
-    if stale_busy and not pending.interrupted_last(a):
-        return "state=busy"
-    kids = children_fn(row)
-    if kids:
-        return "running: " + ", ".join(sorted(set(kids))[:3])
-    return None
+    return activity.background_reason(a, stale_busy) or activity.children_reason(children_fn(row))
 
 
 def order_key(row, rss):
@@ -451,28 +423,9 @@ def hook_failed_sids(cfg):
         return set()
 
 
-class Facts(object):
-    """One snapshot of the slow facts (process table, transcripts) for a policy pass."""
-
+class Facts(activity.Facts):
     def __init__(self, cfg, now=None):
-        self.cfg = cfg
-        self.now = time.time() if now is None else now
-        self.cmds = procs.ps_commands()
-        self._analysis = {}
-
-    def analysis(self, row):
-        sid = row["session_id"]
-        if sid not in self._analysis:
-            tr = row_transcript(row, self.cfg) or row.get("transcript")
-            self._analysis[sid] = pending.analyze(
-                tr, self.now, float(self.cfg.get("cron_recurring_block_h", 24)) * 3600)
-        return self._analysis[sid]
-
-    def children(self, row):
-        return procs.working_children(row["pid"], self.cmds, self.cfg["helper_patterns"])
-
-    def rss(self, rows):
-        return {r["session_id"]: procs.tree_rss_mb(r["pid"], self.cmds) for r in rows if r.get("pid")}
+        super().__init__(cfg, time.time() if now is None else now)
 
 
 def compute_policy(cfg, focus_state, rows, evictions_today, explicit=False, now=None):
@@ -1066,6 +1019,7 @@ def iterm_running():
 
 API_DISABLED_RETRY_S = 600
 API_DISABLED_CHUNK_S = 60  # liveness is written before each chunk (doctor: DAEMON_FRESH_S 120)
+ALONE_CHECK_CHUNK_S = 10
 
 
 def api_disabled(exc):
@@ -1242,6 +1196,7 @@ class Daemon(object):
         self.blind_since = None
         self.last_blind_meta = None
         self.instance = None  # this daemon's iTerm2: it exits on any connection loss
+        self.gui = None  # loginwindow and WindowServer identities, written into the snapshot
 
     async def off(self, fn, *args):
         """Blocking work (ps, transcript reads, stats) in an executor; SQLite stays here."""
@@ -1313,10 +1268,12 @@ class Daemon(object):
                 self.instance = await self.off(tab_snapshots.iterm_instance)
                 if self.instance is None:
                     return None
+            if self.gui is None:
+                self.gui = await self.off(tab_snapshots.gui_session)
             states = LIVE_STATES + PARKED_STATES
             rows = ledger.all_rows(self.conn, "ended_at IS NULL AND state IN (%s)" %
                                    ",".join("?" * len(states)), states)
-            snap = tab_snapshots.build_snapshot(self.instance, windows, rows, now)
+            snap = tab_snapshots.build_snapshot(self.instance, windows, rows, now, self.gui)
             return await self.off(tab_snapshots.write_snapshot, self.cfg, snap)
         except Exception:
             log.exception("tab snapshot failed")
@@ -1880,6 +1837,8 @@ async def run_connected(connection, cfg, conn, dry_run, get_app, failure=None):
         if getattr(app, "connection", None) is not connection:
             raise ConnectionLost("stale App singleton")
         d = Daemon(cfg, conn, app, connection, dry_run)
+        if failure is not None:
+            failure["daemon"] = d
         log.info("connected to iTerm2")
         record_meta(conn, connected_at=time.time(), last_error="")
         await d.run_loops()
@@ -1887,6 +1846,48 @@ async def run_connected(connection, cfg, conn, dry_run, get_app, failure=None):
         if failure is not None:
             failure["error"] = "%s: %s" % (type(exc).__name__, exc)
         raise
+
+
+def alone_check(cfg, instance, sleep=time.sleep):
+    """After losing iTerm2: did it go down by itself, with the GUI session still up? If so its
+    snapshot gets <snapshot>.ended_alone, and --auto leaves it for a click. The wait is for a
+    logout or a chosen restart, where apps quit first and launchd then stops this agent: the
+    default SIGTERM action kills the process during the sleep (nothing here or in the iterm2
+    package installs a handler), so no marker. loginwindow and WindowServer restart in a crash,
+    and this daemon can outlive iTerm2 by a while then, so a wait alone would not tell. Every
+    "cannot tell" means no marker, which means restoring. -> what it found, for the log."""
+    if not instance:
+        return "no snapshot yet"
+    path = tab_snapshots.snapshot_path(cfg, instance)
+    snap = tab_snapshots.read_snapshot(path)
+    recorded = (snap or {}).get("gui_session")
+    if not recorded:
+        return "snapshot has no gui_session"
+    sleep(float(cfg.get("iterm_alone_check_s", 30)))
+    # a connection can drop with iTerm2 still up; it answers only now, since a quitting
+    # iTerm2 outlives its websocket
+    if tab_snapshots.same_instance(snap, tab_snapshots.iterm_instance()):
+        return "iTerm2 still running"
+    now = tab_snapshots.gui_session()
+    if now is None:
+        return "GUI session unreadable"
+    if now != recorded:
+        return "GUI session changed"
+    tab_snapshots.set_flag(path, tab_snapshots.ENDED_ALONE_SUFFIX)
+    return "went down alone"
+
+
+def after_connection_loss(cfg, conn, instance, reason):
+    """Record why, run the alone check, record the real exit time. The first write comes before
+    the wait because launchd's SIGTERM during it ends the process with nothing further."""
+    record_meta(conn, last_error=reason[:500], last_exit_at=time.time(), liveness=time.time(),
+                pass_started_at="")
+    try:
+        log.info("iTerm2 alone check: %s",
+                 alone_check(cfg, instance, sleep=lambda s: sleep_alive(conn, s, ALONE_CHECK_CHUNK_S)))
+    except Exception:
+        log.exception("iTerm2 alone check failed")
+    record_meta(conn, last_exit_at=time.time(), liveness=time.time())
 
 
 def take_lock(cfg):
@@ -2014,8 +2015,7 @@ def main(argv=None):
         if failure.get("error"):
             reason += ": %s" % failure["error"]
     log.warning("%s; exiting so launchd starts a clean process", reason)
-    record_meta(conn, last_error=reason[:500], last_exit_at=time.time(), liveness=time.time(),
-                pass_started_at="")
+    after_connection_loss(cfg, conn, getattr(failure.get("daemon"), "instance", None), reason)
     return 1
 
 
