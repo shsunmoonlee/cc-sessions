@@ -46,7 +46,8 @@ if _LIB and _LIB not in sys.path:
     sys.path.insert(0, _LIB)
 
 from ccsessions import (EVICTING, HIBERNATED, IDLE, LIVE_STATES,  # noqa: E402
-                        PARKED_STATES, RESUMING, activity, config, ledger, pending, procs, resumecmd)
+                        PARKED_STATES, RESUMING, activity, config, ledger, pending, procs,
+                        resumecmd, tabgroups, tabsort)
 from ccsessions import tabs as tab_snapshots  # noqa: E402
 
 log = logging.getLogger("cc-sessions")
@@ -1280,6 +1281,65 @@ class Daemon(object):
             log.exception("tab snapshot failed")
             return None
 
+    async def sort_tabs(self, focus, force=False):
+        """Keep every window's tabs in cc-tabs' sort order (pinned, needs you, working,
+        the rest by newest activity, non-Claude tabs after), with activity bucketed by
+        tab_sort_bucket_s so the bar only changes when a tab crosses a bucket. Runs each
+        tick when tab_sort is "recent"; force (the tab-sort request) sorts once whatever
+        the config. Reordering moves tabs without selecting one, so no focus event wakes
+        anything. -> a result word for the request log."""
+        mode = str(self.cfg.get("tab_sort") or "off").strip().lower()
+        if not force and mode != "recent":
+            return "tab_sort is %s" % mode
+        if await self.off(tab_snapshots.restore_running, self.cfg):
+            return "a restore is running"
+        panes = focus.get("panes", 0)
+        if panes and focus.get("skipped", 0) == panes:
+            return "blind snapshot"
+        now = time.time()
+        states = LIVE_STATES + PARKED_STATES
+        rows = ledger.all_rows(self.conn, "ended_at IS NULL AND state IN (%s)" %
+                               ",".join("?" * len(states)), states)
+        events = activity.activity_times(self.conn, self.cfg, rows)
+        doc, err = tabgroups.read(self.cfg)
+        if err:
+            log.warning("tab sort: %s; sorting with no groups or pins", err)
+        live, parked = tab_snapshots.session_index(rows)
+        guid_tty = {g: t for t, g in focus["tty_guid"].items()}
+        bucket_s = float(self.cfg.get("tab_sort_bucket_s") or 0)
+        moved = 0
+        for w in self.app.terminal_windows:
+            tabs = list(w.tabs)
+            if len(tabs) < 2:
+                continue
+            tab_rows = []
+            for t in tabs:
+                matched = [tab_snapshots.pane_row(
+                    {"guid": s.session_id, "tty": guid_tty.get(s.session_id)}, live, parked)
+                    for s in t.sessions]
+                tab_rows.append([r for r in matched if r])
+            order = await self.off(self._tab_order, tab_rows, events, doc, bucket_s, now)
+            if order == list(range(len(tabs))):
+                continue
+            n = sum(1 for pos, i in enumerate(order) if pos != i)
+            if self.dry_run:
+                log.info("DRY RUN would move %d tab(s) in window %s", n, w.window_id)
+                continue
+            await iterm_call(w.async_set_tabs([tabs[i] for i in order]), "set_tabs")
+            moved += n
+        if moved:
+            log.info("tab sort moved %d tab(s)", moved)
+        return "moved %d tab(s)" % moved
+
+    def _tab_order(self, tab_rows, events, doc, bucket_s, now):
+        """The blocking half of a sort (work_reason reads transcripts and ps): executor
+        work, no SQLite."""
+        facts = Facts(self.cfg, now)
+
+        def work(row):
+            return activity.work_reason(row, now, self.cfg, facts.analysis, facts.children)
+        return tabsort.order(tab_rows, events, doc, work, bucket_s)
+
     def heartbeat(self):
         now = time.time()
         with ledger.tx(self.conn):
@@ -1445,6 +1505,12 @@ class Daemon(object):
         focus = await self.snapshot()
         await self.write_tab_snapshot(focus, now)
         self.stamp_visibility(focus, now)
+        try:
+            await self.sort_tabs(focus)
+        except ConnectionLost:
+            raise
+        except Exception:
+            log.exception("tab sort failed")
         if now - self.last_reap > REAP_EVERY_S:
             from ccsessions import cli
             removed, _ = await self.off(functools.partial(cli.reap, self.cfg, dry_run=self.dry_run,
@@ -1540,6 +1606,8 @@ class Daemon(object):
 
     async def do_request(self, req):
         kind, sid = req["kind"], req.get("session_id")
+        if kind == "tab-sort":
+            return await self.sort_tabs(await self.snapshot(), force=True)
         if kind == "title":  # first: a restore queues one per typed tab, none needs free memory
             row = ledger.get(self.conn, sid)
             return await self.title_tab(row, req.get("ts")) if row else "unknown session"
