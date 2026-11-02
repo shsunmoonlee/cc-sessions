@@ -1,7 +1,10 @@
 """What a session is doing, shared by the daemon and `cc-tabs`: the in-flight checks behind
 guard_reason (so the Working bucket and hibernation cannot disagree), the activity key, the
 tab sort order, close-idle's refusals and the picker's rows. Stdlib only."""
+import calendar
+import json
 import os
+import time
 
 from . import BUSY, HIBERNATED, IDLE, LIVE_STATES, WAITING, ledger, pending, procs
 from . import tabs as tabfile
@@ -9,6 +12,11 @@ from . import tabs as tabfile
 # A subagent finishing counts: it did the work. SessionStart and SessionEnd do not: a tab
 # opened or torn down says nothing about the session being used.
 ACTIVITY_EVENTS = ("UserPromptSubmit", "Stop", "StopFailure", "SubagentStop")
+# user records nobody typed
+NOT_TYPED_PREFIXES = ("<task-notification", "<system-reminder", "<local-command", "<command-", "<ide_", "Caveat:",
+                      "This session is being continued", "WorktreeCreate hook failed")
+TAIL_CHUNK = 1 << 20
+TAIL_LIMIT = 64 << 20
 
 PINNED, NEEDS_YOU, WORKING, REST, NON_CLAUDE = range(5)
 BUCKET_NAMES = {PINNED: "pinned", NEEDS_YOU: "needs you", WORKING: "working", REST: "rest", NON_CLAUDE: "other"}
@@ -122,9 +130,87 @@ def newest_events(conn, session_id=None):
     return {r[0]: r[1] for r in conn.execute(sql + " GROUP BY session_id", args) if r[0]}
 
 
+def _timestamp(text):
+    try:
+        return float(calendar.timegm(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_is_work(d):
+    """A prompt someone typed, or a real reply. A resume appends meta and synthetic records with
+    fresh timestamps, so a woken session must not look used; the replies to a background task's
+    notification still count through the assistant branch."""
+    if d.get("isSidechain") or d.get("isMeta") or d.get("isCompactSummary"):
+        return False
+    msg = d.get("message") or {}
+    content = msg.get("content")
+    if d.get("type") == "assistant":
+        if msg.get("model") == "<synthetic>" or d.get("isApiErrorMessage") or not isinstance(content, list):
+            return False
+        return any(isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip()
+                   for b in content)
+    if d.get("type") != "user":
+        return False
+    if isinstance(content, list):
+        content = " ".join(b.get("text") or "" for b in content if isinstance(b, dict) and b.get("type") == "text")
+    text = (content or "").strip() if isinstance(content, str) else ""
+    return bool(text) and not text.startswith(NOT_TYPED_PREFIXES)
+
+
+def last_work_time(path, chunk=TAIL_CHUNK, limit=TAIL_LIMIT):
+    """When this transcript last held real work, read from the end. None when none turns up
+    within `limit` bytes or the file can't be read."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            floor = max(0, pos - limit)
+            tail = b""
+            while pos > floor:
+                step = min(chunk, pos - floor)
+                pos -= step
+                fh.seek(pos)
+                data = fh.read(step) + tail
+                if pos > 0 and b"\n" not in data:
+                    tail = data
+                    continue
+                lines = data.split(b"\n")
+                # the first piece may be the end of a line that starts in an earlier chunk
+                tail = lines.pop(0) if pos > 0 else b""
+                for line in reversed(lines):
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(d, dict) and _record_is_work(d):
+                        ts = _timestamp(d.get("timestamp"))
+                        if ts:
+                            return ts
+    except OSError:
+        pass
+    return None
+
+
+def activity_times(conn, cfg, rows, session_id=None):
+    """{session id: newest activity}. Events are pruned at 30 days, so a session with none left
+    gets the time from its transcript. `session_id`: that one session only."""
+    if session_id is not None:
+        rows = [r for r in rows if r["session_id"] == session_id]
+    times = newest_events(conn, session_id)
+    for r in rows:
+        if r["session_id"] not in times:
+            path = row_transcript(r, cfg)
+            ts = last_work_time(path) if path else None
+            if ts:
+                times[r["session_id"]] = ts
+    return times
+
+
 def activity_time(row, events):
-    """Newest activity event, else the later of start and resume; 0 when there is neither."""
-    return events.get(row["session_id"]) or max(row.get("started_at") or 0, row.get("resumed_at") or 0)
+    """Newest activity, else when the session started, 0 when unknown. Never the resume time:
+    opening or waking a session doesn't make it recent."""
+    return events.get(row["session_id"]) or row.get("started_at") or 0
 
 
 # ------------------------------------------------------------------ sort order
@@ -212,14 +298,15 @@ def row_refusal(row, now, days, entry, activity, probe):
     return None
 
 
-def idle_estimate(conn, doc, days, now, guids_fn):
+def idle_estimate(conn, doc, days, now, guids_fn, cfg=None):
     """About how many tabs close-idle would close, for the menu's minute refresh: no cookie, no
     websocket, no iterm2 import. It cannot see the selected tab, a split or the foreground job,
     so it can read high; a click gets the exact number from a dry run. guids_fn runs only when
     a row qualifies, and returns the live tab GUIDs or None. -> count, None when not asked."""
     from . import tabgroups
-    events = newest_events(conn)
-    parked = tabfile.session_index(resumable_rows(conn))[1]
+    rows = resumable_rows(conn)
+    events = activity_times(conn, cfg, rows) if cfg is not None else newest_events(conn)
+    parked = tabfile.session_index(rows)[1]
     hits = [guid for guid, r in parked.items()
             if row_refusal(r, now, days, tabgroups.entry(doc, r["session_id"]), activity_time(r, events),
                            procs.identity_probe) is None]

@@ -294,7 +294,7 @@ def tabs_data(cfg, conn, ask=True, idle_days=None):
            "snapshots": snapshots}
     if idle_days is not None:
         doc, err = tabgroups.read(cfg)  # close-idle closes nothing on an unreadable file
-        idle = 0 if err else activity.idle_estimate(conn, doc, idle_days, time.time(), live_guids)
+        idle = 0 if err else activity.idle_estimate(conn, doc, idle_days, time.time(), live_guids, cfg)
         out["idle_tabs"] = idle or 0
         out["idle_tabs_known"] = idle is not None
     return out

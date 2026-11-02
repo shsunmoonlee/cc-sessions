@@ -186,8 +186,9 @@ async def sort_window(cfg, conn, win, doc, dry_run=False, out=print, now=None):
     now = time.time() if now is None else now
     tabs = await window_tabs(win)
     panes = [p for t in tabs for p in t["panes"]]
-    matched = tabfile.match_panes(panes, open_rows(conn), memo_running())
-    events = activity.newest_events(conn)
+    rows = open_rows(conn)
+    matched = tabfile.match_panes(panes, rows, memo_running())
+    events = activity.activity_times(conn, cfg, rows)
     facts = activity.Facts(cfg, now)
 
     def work(row):
@@ -242,7 +243,8 @@ def find_data(cfg, conn, live_guids):
     doc, err = tabgroups.read(cfg)
     if err:
         print("cc-tabs: %s" % err, file=sys.stderr)
-    return activity.find_rows(activity.resumable_rows(conn), activity.newest_events(conn),
+    rows = activity.resumable_rows(conn)
+    return activity.find_rows(rows, activity.activity_times(conn, cfg, rows),
                               lambda s: tabgroups.group_of(doc, s), lambda s: tabgroups.is_pinned(doc, s),
                               live_guids)
 
@@ -317,7 +319,7 @@ async def close_candidates(cfg, conn, app, days, now=None, only=None):
     now = time.time() if now is None else now
     await app.async_refresh()
     rows = open_rows(conn)
-    events = activity.newest_events(conn)
+    events = activity.activity_times(conn, cfg, rows)
     closing = []
     for win in app.terminal_windows:
         for t in await window_tabs(win):
@@ -342,8 +344,9 @@ async def close_recheck(cfg, conn, app, days, tab, pane, row):
     win = window_of(app, tab)
     if win is None:
         return "its tab is gone"
-    fresh, why = refusal(win, tab, pane, open_rows(conn), tabgroups.load(cfg),
-                         lambda s: activity.newest_events(conn, s), days, time.time())
+    rows = open_rows(conn)
+    fresh, why = refusal(win, tab, pane, rows, tabgroups.load(cfg),
+                         lambda s: activity.activity_times(conn, cfg, rows, s), days, time.time())
     if not why and fresh["session_id"] != row["session_id"]:
         return "another session is in that tab now"
     return why

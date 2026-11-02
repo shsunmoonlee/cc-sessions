@@ -27,6 +27,15 @@ NOW = 2_000_000_000.0
 LONG_AGO = NOW - 30 * 86400
 
 
+def transcript_at(folder, name, when):
+    """A transcript whose only work is one reply at `when`."""
+    path = os.path.join(folder, name)
+    with open(path, "w") as fh:
+        fh.write(json.dumps({"type": "assistant", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(when)),
+                             "message": {"model": "m", "content": [{"type": "text", "text": "done"}]}}) + "\n")
+    return path
+
+
 def arun(coro):
     loop = asyncio.new_event_loop()
     try:
@@ -723,9 +732,11 @@ class ActivityKey(Base):
             ledger.apply_event(self.conn, event, {"session_id": "h1", "reason": "other"}, None, now=ts)
         self.assertEqual(activity.newest_events(self.conn)["h1"], 1003.0)
 
-    def test_fallback_is_later_of_start_and_resume(self):
+    def test_waking_a_session_never_makes_it_recent(self):
         r = {"session_id": "x", "started_at": 5.0, "resumed_at": 9.0}
-        self.assertEqual(activity.activity_time(r, {}), 9.0)
+        self.assertEqual(activity.activity_time(r, {}), 5.0)
+        r = {"session_id": "x", "started_at": None, "resumed_at": 9.0}
+        self.assertEqual(activity.activity_time(r, {}), 0)
         r = {"session_id": "x", "started_at": 5.0, "resumed_at": None}
         self.assertEqual(activity.activity_time(r, {}), 5.0)
         self.assertEqual(activity.activity_time({"session_id": "x"}, {}), 0)
@@ -1097,6 +1108,15 @@ class Sort(ToolEnv):
         self.do_sort(win)
         self.assertEqual(self.names(win), ["T5", "T4", "T3", "T2", "T6", "T7", "T1", "T8"])
 
+    def test_a_woken_old_session_ranks_by_its_transcript_not_the_wake(self):
+        win = Window([tab(1), tab(2)])
+        old = transcript_at(self.tmp, "old.jsonl", time.time() - 50 * 86400)
+        newer = transcript_at(self.tmp, "newer.jsonl", time.time() - 40 * 86400)
+        self.hibernated("old", 1, transcript=old, resumed_at=time.time(), started_at=1.0)
+        self.hibernated("newer", 2, transcript=newer, started_at=1.0)
+        self.do_sort(win)
+        self.assertEqual(self.names(win), ["T2", "T1"])
+
     def test_an_idle_row_with_a_subagent_goes_above_newer_idle_rows(self):
         win = Window([tab(1), tab(2)])
         self.live("newer", 1, started_at=900.0)
@@ -1208,6 +1228,12 @@ class Sort(ToolEnv):
 class Find(ToolEnv):
     def rows(self, live_guids=frozenset()):
         return T.find_data(self.cfg, self.conn, set(live_guids))
+
+    def test_a_woken_old_session_shows_its_transcript_time(self):
+        when = int(time.time() - 50 * 86400)
+        self.hibernated("h", 1, transcript=transcript_at(self.tmp, "h.jsonl", when), resumed_at=time.time(),
+                        started_at=50.0)
+        self.assertEqual(self.rows()[0]["activity"], float(when))
 
     def test_fields(self):
         self.hibernated("h", 1, title="parked one", cwd="/some/path/proj", started_at=50.0)
@@ -1405,6 +1431,15 @@ class CloseIdle(ToolEnv):
     def assertRefused(self):
         self.assertEqual(self.run_close(), 0)
         self.assertFalse(self.target.closed)
+
+    def test_recent_work_in_the_transcript_keeps_the_tab_open(self):
+        self.row(transcript=transcript_at(self.tmp, "h.jsonl", self.now - 3600))
+        self.assertEqual(self.run_close(dry_run=True), 0)
+        self.assertRefused()
+
+    def test_old_work_in_the_transcript_closes_even_when_just_woken(self):
+        self.row(transcript=transcript_at(self.tmp, "h.jsonl", self.now - 30 * 86400), resumed_at=self.now - 60)
+        self.assertCloses()
 
     def test_all_conditions_hold_closes_with_force_and_keeps_the_row(self):
         self.row()
@@ -2317,3 +2352,154 @@ class NewTabReopensAClosedSession(TempEnv):
 
         guid = arun(D.ItermTabs(App(), None).new_tab("resume\r"))
         self.assertEqual((guid, sent), ("NEW-SESSION", ["resume\r"]))
+
+
+
+class TranscriptActivity(TempEnv):
+    """A session with no events left (pruned at 30 days) is ranked from its transcript."""
+
+    def write(self, *records, name="t.jsonl"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w") as fh:
+            for r in records:
+                fh.write(json.dumps(r) + "\n")
+        return path
+
+    @staticmethod
+    def stamp(day):
+        return "2026-09-%02dT10:00:00.000Z" % day
+
+    def typed(self, day, text="fix this"):
+        return {"type": "user", "timestamp": self.stamp(day), "message": {"role": "user", "content": text}}
+
+    def reply(self, day, text="done", **extra):
+        return dict({"type": "assistant", "timestamp": self.stamp(day),
+                     "message": {"role": "assistant", "model": "m", "content": [{"type": "text", "text": text}]}}, **extra)
+
+    def epoch(self, day):
+        return activity._timestamp(self.stamp(day))
+
+    def test_a_reply_after_the_prompt_counts(self):
+        self.assertEqual(activity.last_work_time(self.write(self.typed(1), self.reply(2))), self.epoch(2))
+
+    def test_a_typed_prompt_counts(self):
+        self.assertEqual(activity.last_work_time(self.write(self.reply(1), self.typed(2))), self.epoch(2))
+
+    def test_prompt_as_text_blocks_counts(self):
+        rec = {"type": "user", "timestamp": self.stamp(2),
+               "message": {"content": [{"type": "text", "text": "fix this"}]}}
+        self.assertEqual(activity.last_work_time(self.write(self.reply(1), rec)), self.epoch(2))
+
+    def test_what_a_resume_appends_does_not_count(self):
+        noise = [
+            {"type": "user", "isMeta": True, "timestamp": self.stamp(20), "message": {"content": "hook context"}},
+            self.typed(21, "<local-command-stdout>x</local-command-stdout>"),
+            self.typed(22, "<command-name>/resume</command-name>"),
+            self.typed(23, "<system-reminder>x</system-reminder>"),
+            self.typed(24, "Caveat: the messages below"),
+            self.typed(25, "This session is being continued from a previous conversation"),
+            self.typed(26, "<task-notification>done</task-notification>"),
+            {"type": "system", "timestamp": self.stamp(27), "message": {"content": "x"}},
+            {"type": "assistant", "timestamp": self.stamp(28),
+             "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "No response requested."}]}},
+            self.reply(29, isApiErrorMessage=True),
+            {"type": "user", "isCompactSummary": True, "timestamp": self.stamp(30), "message": {"content": "summary"}},
+        ]
+        self.assertEqual(activity.last_work_time(self.write(self.typed(1), self.reply(2), *noise)), self.epoch(2))
+
+    def test_a_subagents_lines_and_tool_results_do_not_count_here(self):
+        side = dict(self.reply(20), isSidechain=True)
+        tool = {"type": "user", "timestamp": self.stamp(21),
+                "message": {"content": [{"type": "tool_result", "content": "x"}]}}
+        only_tool = {"type": "assistant", "timestamp": self.stamp(22),
+                     "message": {"model": "m", "content": [{"type": "tool_use", "name": "Bash"}]}}
+        self.assertEqual(activity.last_work_time(self.write(self.reply(2), side, tool, only_tool)), self.epoch(2))
+
+    def test_a_reply_to_a_background_notification_counts(self):
+        note = self.typed(20, "<task-notification>done</task-notification>")
+        self.assertEqual(activity.last_work_time(self.write(self.typed(1), note, self.reply(21))), self.epoch(21))
+
+    def test_a_record_longer_than_a_chunk_is_read_whole(self):
+        big = self.reply(5, text="x" * 5000)
+        self.assertEqual(activity.last_work_time(self.write(self.reply(1), big), chunk=64), self.epoch(5))
+
+    def test_a_chunk_boundary_finds_the_right_record(self):
+        rows = [self.reply(1)] + [{"type": "system", "timestamp": self.stamp(9), "message": {"content": "p" * 300}}] * 40
+        self.assertEqual(activity.last_work_time(self.write(*rows), chunk=100), self.epoch(1))
+
+    def test_limit_gives_up_rather_than_reading_everything(self):
+        rows = [self.reply(1)] + [{"type": "system", "timestamp": self.stamp(9), "message": {"content": "p" * 300}}] * 40
+        self.assertIsNone(activity.last_work_time(self.write(*rows), chunk=100, limit=500))
+
+    def test_garbage_and_unreadable_files_give_none(self):
+        bad = os.path.join(self.tmp, "bad.jsonl")
+        with open(bad, "wb") as fh:
+            fh.write(b"not json\n\xff\xfe\n[1,2]\n")
+        self.assertIsNone(activity.last_work_time(bad))
+        self.assertIsNone(activity.last_work_time(os.path.join(self.tmp, "missing.jsonl")))
+
+    def test_a_record_with_a_bad_timestamp_is_passed_over(self):
+        rec = dict(self.reply(3), timestamp="soon")
+        self.assertEqual(activity.last_work_time(self.write(self.reply(1), rec)), self.epoch(1))
+
+    def insert(self, sid, **kw):
+        ledger.apply_event(self.conn, "SessionStart", {"session_id": sid}, None, now=kw.pop("started", 1000.0))
+        with ledger.tx(self.conn):
+            for k, v in kw.items():
+                self.conn.execute("UPDATE sessions SET %s=? WHERE session_id=?" % k, (v, sid))
+        return ledger.get(self.conn, sid)
+
+    def test_a_woken_session_with_no_events_ranks_by_its_transcript(self):
+        path = self.write(self.typed(9), self.reply(9))
+        r = self.insert("old", transcript=path, resumed_at=time.time())
+        times = activity.activity_times(self.conn, self.cfg, [r])
+        self.assertEqual(activity.activity_time(r, times), self.epoch(9))
+
+    def test_a_used_session_outranks_a_woken_old_one(self):
+        old = self.insert("old", transcript=self.write(self.reply(9), name="o.jsonl"), resumed_at=time.time())
+        used = self.insert("used", transcript=self.write(self.reply(9), name="u.jsonl"))
+        ledger.apply_event(self.conn, "Stop", {"session_id": "used"}, None, now=self.epoch(20))
+        times = activity.activity_times(self.conn, self.cfg, [old, used])
+        self.assertGreater(activity.activity_time(used, times), activity.activity_time(old, times))
+
+    def test_an_event_wins_and_its_transcript_is_not_read(self):
+        r = self.insert("s", transcript=self.write(self.reply(9)))
+        ledger.apply_event(self.conn, "Stop", {"session_id": "s"}, None, now=5000.0)
+        with mock.patch.object(activity, "last_work_time", side_effect=AssertionError("read")):
+            self.assertEqual(activity.activity_times(self.conn, self.cfg, [r])["s"], 5000.0)
+
+    def test_no_transcript_falls_back_to_the_start(self):
+        r = self.insert("s", started_at=77.0, transcript=os.path.join(self.tmp, "none.jsonl"))
+        self.assertEqual(activity.activity_time(r, activity.activity_times(self.conn, self.cfg, [r])), 77.0)
+
+    def test_one_session_reads_only_that_transcript(self):
+        a = self.insert("a", transcript=self.write(self.reply(1), name="a.jsonl"))
+        b = self.insert("b", transcript=self.write(self.reply(2), name="b.jsonl"))
+        self.assertEqual(activity.activity_times(self.conn, self.cfg, [a, b], "b"), {"b": self.epoch(2)})
+
+    def parked(self, sid, day, guid, now):
+        self.insert(sid, transcript=self.write(self.reply(day), name=sid + ".jsonl"), state="hibernated",
+                    resumed_at=now - 60, evicted_at=now - 30, iterm_guid=guid, pid=None, pid_start=None)
+
+    def test_the_idle_estimate_reads_the_transcript_time(self):
+        now = self.epoch(30)
+        doc = {"groups": {}, "sessions": {}}
+        self.parked("recent", 29, "G1", now)
+        self.assertEqual(activity.idle_estimate(self.conn, doc, 7, now, lambda: {"G1"}, self.cfg), 0)
+        self.parked("old", 1, "G2", now)
+        self.assertEqual(activity.idle_estimate(self.conn, doc, 7, now, lambda: {"G1", "G2"}, self.cfg), 1)
+
+    def test_the_menus_idle_count_passes_the_config_through(self):
+        now = time.time()
+        recent = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now - 3600))
+        rec = dict(self.reply(1), timestamp=recent)
+        self.insert("recent", transcript=self.write(rec, name="r.jsonl"), state="hibernated", resumed_at=now - 60,
+                    evicted_at=now - 30, iterm_guid="G1", pid=None, pid_start=None)
+        with mock.patch.object(restore, "iterm_guids", return_value={"G1"}), \
+                mock.patch.object(tabfile, "iterm_instance", return_value=dict(INSTANCE)):
+            self.assertEqual(cli.tabs_data(self.cfg, self.conn, idle_days=7)["idle_tabs"], 0)
+
+    def test_injected_ide_and_hook_lines_do_not_count(self):
+        noise = [self.typed(20, "<ide_opened_file>x</ide_opened_file>"),
+                 self.typed(21, "WorktreeCreate hook failed: x")]
+        self.assertEqual(activity.last_work_time(self.write(self.reply(2), *noise)), self.epoch(2))
