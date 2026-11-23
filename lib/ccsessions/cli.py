@@ -300,7 +300,51 @@ def tabs_data(cfg, conn, ask=True, idle_days=None):
     return out
 
 
+def set_config_key(key, value):
+    """Set one key in the config file (created when missing). -> its path. Raises on a
+    file that exists but does not parse: a broken config is never clobbered."""
+    from . import tabs
+    p = config.config_path()
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("config root is not an object")
+    except FileNotFoundError:
+        data = {}
+    data[key] = value
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    tabs.atomic_write(p, (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8"))
+    return p
+
+
+def tabs_sort(cfg, a):
+    """Bare: one sort now (a daemon request). --on/--off: flip tab_sort in the config,
+    which the running daemon reads only at start."""
+    if a.on and a.off:
+        print("pick one of --on / --off", file=sys.stderr)
+        return 2
+    if a.on or a.off:
+        value = "recent" if a.on else "off"
+        try:
+            p = set_config_key("tab_sort", value)
+        except (OSError, ValueError) as exc:
+            print("not written: %s" % exc, file=sys.stderr)
+            return 1
+        label = os.path.splitext(os.path.basename(cfg.path("launchd_plist")))[0]
+        print("tab_sort = %s (%s)" % (value, p))
+        print("the running daemon keeps its old config; apply with:")
+        print("  launchctl kickstart -k gui/%d/%s" % (os.getuid(), label))
+        return 0
+    return _request(cfg, "tab-sort", None)
+
+
 def cmd_tabs(cfg, a):
+    if a.action == "sort":
+        return tabs_sort(cfg, a)
+    if a.on or a.off:
+        print("--on/--off go with `tabs sort`", file=sys.stderr)
+        return 2
     d = tabs_data(cfg, _open(cfg), ask=not a.no_ask, idle_days=a.idle_days)
     if a.json:
         print(json.dumps(d, indent=1))
@@ -606,6 +650,10 @@ def build_parser():
     p.add_argument("--snapshot", metavar="PATH", help="restore this snapshot file (see `tabs`)")
     p.add_argument("--dismiss", action="store_true", help="wave off the newest previous snapshot")
     p = sub.add_parser("tabs", help="tab snapshots, and what restore would open now")
+    p.add_argument("action", nargs="?", choices=["sort"],
+                   help="sort: order tabs by recency once; --on keeps them sorted every tick")
+    p.add_argument("--on", action="store_true", help="with sort: set tab_sort=recent in the config")
+    p.add_argument("--off", action="store_true", help="with sort: set tab_sort=off")
     p.add_argument("--json", action="store_true")
     p.add_argument("--idle-days", type=float, metavar="N",
                    help="also estimate how many tabs `cc-tabs close-idle --days N` would close")

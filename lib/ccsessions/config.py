@@ -60,6 +60,12 @@ DEFAULTS = {
     "iterm_alone_check_s": 30,
     # null = cc-sessions-groups.json beside the ledger
     "groups_file": None,
+    # "recent": the daemon keeps every window's tabs in cc-tabs' sort order each tick
+    # (pinned, needs you, working, the rest by newest activity); "off" = never by itself
+    "tab_sort": "off",
+    # tabs swap places by recency only across buckets this many seconds wide, so the
+    # tab bar never dances on every hook event (0 = raw recency)
+    "tab_sort_bucket_s": 600,
     # What gets typed into a tab to resume a session. null = the cc-resume installed
     # next to this package (bin/cc-resume).
     "resume_command": None,

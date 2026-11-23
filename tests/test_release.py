@@ -17,6 +17,9 @@ def tree_files():
     for root, dirs, files in os.walk(REPO):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for f in files:
+            # in a git worktree .git is a file holding an absolute gitdir path
+            if f == ".git":
+                continue
             yield os.path.join(root, f)
 
 
