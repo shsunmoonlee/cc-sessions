@@ -80,6 +80,12 @@ RECENT_STARTS = 10
 TITLE_CACHE_MAX = 256
 TTY_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
              "\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[<u\x1b[?7h\x1b[0m\x1b>")
+# written while zsh is at the prompt: no ?2004l (zsh owns bracketed paste) and no ?1049l
+# (leaving an alt screen we are not in restores a saved cursor under ZLE)
+FOCUS_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
+               "\x1b[?1004l\x1b[?25h\x1b[<u")
+BANNER_WRITE_TIMEOUT_S = 4.0
+FOCUS_WRITE_TIMEOUT_S = 1.0
 
 
 # ------------------------------------------------------------------ pure policy
@@ -505,10 +511,11 @@ class Evictor(object):
     evicting (INCIDENT) for reconcile.
 
     identity(row) -> ALIVE | GONE | UNKNOWN (bools accepted); recheck(row) -> reason|None
-    runs AFTER the CAS; children(row) -> [(pid, start)] captured before any signal;
-    child_probe(pid, start) -> ALIVE | GONE | UNKNOWN; offload(fn, *args) runs blocking
-    probes off the event loop. `tabs`: async job_name, tty, is_visible, inject, set_name,
-    send_text (by GUID)."""
+    runs AFTER the CAS; children(row) -> [(pid, start, comm)] captured before any signal
+    (2-tuples accepted); child_probe(pid, start) -> ALIVE | GONE | UNKNOWN; offload(fn,
+    *args) runs blocking probes off the event loop. `tabs`: async job_name, tty, is_visible,
+    inject, set_name, send_text (by GUID). The banner goes straight to the tty device
+    (procs.tty_open / tty_write_fd), through iTerm2's inject only when nothing got out."""
 
     def __init__(self, conn, cfg, tabs, kill=os.kill, identity=None, clock=time.time,
                  sleep=asyncio.sleep, on_evict=None, children=None, child_probe=None, offload=None):
@@ -597,6 +604,7 @@ class Evictor(object):
         if p == procs.ALIVE:
             log.error("INCIDENT evict %s: still alive %ss after SIGTERM, sending SIGKILL "
                       "(SessionEnd hooks will not run)", sid[:8], self.cfg["term_grace_s"])
+            await self.log_hang(row, kids)
             try:
                 self.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -670,8 +678,29 @@ class Evictor(object):
             return why + " before signal"
         return None
 
+    async def log_hang(self, row, kids):
+        """Why SIGTERM did not end it: process state, the tty's unread output queue (a full
+        one blocks the writer) and the children by command basename. Never raises."""
+        sid = row["session_id"][:8]
+        try:
+            st = await self._call(procs.proc_stat, int(row["pid"]))
+        except Exception:
+            st = None
+        try:
+            outq = await self._call(procs.tty_outq, row.get("tty"))
+        except Exception:
+            outq = None
+        try:
+            names = ", ".join("%s %s" % (k[0], k[2] if len(k) > 2 else "?") for k in kids)
+            log.error("INCIDENT evict %s: before SIGKILL stat=%s tty_outq=%s children=[%s]",
+                      sid, st, outq, names)
+        except Exception:
+            log.exception("evict %s: hang diagnostics failed", sid)
+
     async def kill_children(self, sid, kids):
-        for cpid, cstart in kids:
+        for kid in kids:
+            cpid, cstart = kid[0], kid[1]
+            comm = kid[2] if len(kid) > 2 else "?"
             try:
                 st = _as_state(await self._call(self.child_probe, cpid, cstart))
             except Exception:
@@ -680,7 +709,7 @@ class Evictor(object):
                 continue
             try:
                 self.kill(int(cpid), signal.SIGKILL)
-                log.warning("evict %s: SIGKILLed child %s of the killed session", sid[:8], cpid)
+                log.warning("evict %s: SIGKILLed child %s (%s) of the killed session", sid[:8], cpid, comm)
             except OSError as exc:
                 log.warning("evict %s: could not SIGKILL child %s: %s", sid[:8], cpid, exc)
 
@@ -701,6 +730,21 @@ class Evictor(object):
         if job is None:
             log.warning("evict %s: tab is gone; nothing typed", sid)
             return False
+        # opened before the tab's tty is re-checked, so that check also covers this node
+        try:
+            fd = await self._call(procs.tty_open, row.get("tty"))
+        except Exception:
+            fd = None
+        held = [fd]  # write_banner takes it: the worker thread then owns (and closes) it
+        try:
+            return await self._prepare_open_tab(row, title, guid, job, waited, held)
+        finally:
+            if held[0] is not None:
+                with contextlib.suppress(OSError):
+                    os.close(held[0])
+
+    async def _prepare_open_tab(self, row, title, guid, job, waited, held):
+        sid = row["session_id"][:8]
         # the tab may have been reused or brought forward while we waited
         tty = procs.norm_tty(await self.tabs.tty(guid))
         if tty != row.get("tty"):
@@ -726,11 +770,40 @@ class Evictor(object):
                  "  press Enter to resume here\x1b[0m\r\n" % (TTY_RESET, title)
         if not self._still_hibernated(row, "before the banner"):
             return False
-        await self.tabs.inject(guid, banner.encode("utf-8"))
+        await self.write_banner(sid, guid, row.get("tty"), held, banner)
         if not self._still_hibernated(row, "before typing"):
             return False
         await self.tabs.send_text(guid, resumecmd.command(self.cfg, row["session_id"], row.get("cwd")))
         return True
+
+    async def write_banner(self, sid, guid, tty, held, banner):
+        """Through the tty device: queued behind whatever the dead process wrote last, which
+        iTerm2's inject is not. Falls back to inject only when no byte got out; a partial
+        write is left as is (injecting would repeat or truncate it). The fd in held[0] is
+        handed to the worker thread, which closes it even if this coroutine is cancelled."""
+        payload = (procs.TTY_ABORT + banner).encode("utf-8")
+        fd, held[0] = held[0], None
+        n, outq = 0, None
+        if fd is not None:
+            try:
+                n = await self._call(procs.tty_write_close, fd, payload, BANNER_WRITE_TIMEOUT_S) or 0
+            except Exception:
+                n = 0
+        if n >= len(payload):
+            return
+        if n > 0:
+            reset = len((procs.TTY_ABORT + TTY_RESET).encode("utf-8"))
+            log.warning("evict %s: tty write got %d of %d bytes out; banner left partial%s",
+                        sid, n, len(payload), ", reset incomplete" if n < reset else "")
+            return
+        if fd is not None:
+            try:
+                outq = await self._call(procs.tty_outq, tty)
+            except Exception:
+                outq = None
+        log.warning("evict %s: tty write got 0 bytes out (outq=%s); banner injected through iTerm2",
+                    sid, outq)
+        await self.tabs.inject(guid, banner.encode("utf-8"))
 
     def _still_hibernated(self, row, when):
         st = ledger.state_of(self.conn, row["session_id"])
@@ -1758,6 +1831,8 @@ class Daemon(object):
         row = hib[0]
         job = (await iterm_call(session.async_get_variable("jobName"), "jobName")) or ""
         job = await settled_job(job, tty, self.off, self.prompt_recheck)
+        if is_shell_job(job) and not self.dry_run:
+            await self.reset_modes(tty, row)
         gone = await self.identity(row) == procs.GONE
         why = resume_decision(row, guid, tty, now, self.last_fire, job, lambda r: not gone)
         if why:
@@ -1783,6 +1858,19 @@ class Daemon(object):
             "\x15" + resumecmd.command(self.cfg, row["session_id"], row.get("cwd")) + "\r"), "send_text")
         await iterm_call(session.async_set_name(await self.resume_title(row)), "set_name")
         log.info("resumed %s on focus (%s)", row["session_id"][:8], tty)
+
+    async def reset_modes(self, tty, row):
+        """A hibernated tab at a shell: turn off the mouse/focus reporting a killed Claude
+        may have left on (the eviction banner can lose that race). Straight to the tty, no
+        iTerm2 call; best effort."""
+        try:
+            payload = (procs.TTY_ABORT + FOCUS_RESET).encode("utf-8")
+            n = await self.off(procs.write_tty, tty, payload, FOCUS_WRITE_TIMEOUT_S)
+            log.log(logging.DEBUG if n == len(payload) else logging.INFO,
+                    "focus %s: terminal mode reset for %s (%s of %d bytes)",
+                    tty, row["session_id"][:8], n, len(payload))
+        except Exception as exc:
+            log.warning("focus %s: terminal mode reset failed for %s: %s", tty, row["session_id"][:8], exc)
 
     async def focus_loop(self):
         import iterm2

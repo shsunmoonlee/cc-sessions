@@ -82,6 +82,11 @@ after `term_grace_s` (15 s, logged as an INCIDENT). The tab gets a banner, the t
 Whether a tab is at a shell comes from the tty's foreground process group (`ps`), and from
 iTerm2's job name only when `ps` cannot tell: the job name lags, naming the exited claude
 after the shell has the terminal back.
+The banner, which also turns off the terminal modes Claude set (mouse and focus reporting,
+the alternate screen), is written to the tty device, so it lands after the killed process's
+last output (through iTerm2 only when no byte could be written). Focusing a
+hibernated tab at a shell writes the mouse and focus reporting reset again, in case the
+dead process's last frames switched them back on.
 
 Ledger schema v3 only adds two `evictions` columns (`hook_at`, `hook_runs`). Code older than
 v3 refuses a v3 ledger, so a rollback first runs

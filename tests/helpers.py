@@ -25,6 +25,12 @@ REAL_LOG = os.path.expanduser("~/Library/Logs/cc-sessions.log")
 from ccsessions import config, ledger, procs  # noqa: E402
 
 REAL_FOREGROUND_JOB = procs.foreground_job  # TempEnv stubs it; its own test calls this
+# never open, write to or ps-probe a real tty or process from any test module, TempEnv or
+# not; unit tests that need the real ones patch them back in for the test
+REAL_TTY_OPEN, REAL_WRITE_TTY, REAL_PROC_STAT = procs.tty_open, procs.write_tty, procs.proc_stat
+procs.tty_open = lambda tty: None
+procs.write_tty = lambda tty, data, timeout_s: 0
+procs.proc_stat = lambda pid: None
 
 _quiet = logging.getLogger("cc-sessions")
 _quiet.addHandler(logging.NullHandler())
