@@ -4,9 +4,14 @@ Process identity is (pid, start time): a pid alone is reused by the OS, so every
 that asks "is this row's process still running" compares the stored `pid_start` too.
 """
 import calendar
+import fcntl
 import os
 import re
+import select
+import stat
+import struct
 import subprocess
+import termios
 import time
 
 # LC_ALL=C fixes the lstart format; TZ=UTC0 makes it timezone-independent, so the parsed
@@ -50,6 +55,107 @@ def norm_tty(tty):
     if re.match(r"^s\d+$", t):
         t = "tty" + t
     return t
+
+
+# CAN then ST: ends whatever CSI/OSC/DCS a killed process left half-written, so the bytes
+# after it are read as the reset they are
+TTY_ABORT = "\x18\x1b\\"
+_TTY_NAME = re.compile(r"^ttys\d+$")
+
+
+def tty_open(tty):
+    """A write-only, non-blocking fd on /dev/ttysNNN that this user owns, or None. Never
+    raises, and opens nothing for a name that is not a plain ttysNNN."""
+    t = norm_tty(tty)
+    if not t or not _TTY_NAME.match(t):
+        return None
+    try:
+        fd = os.open("/dev/" + t, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    except (OSError, ValueError):
+        return None
+    try:
+        st = os.fstat(fd)
+        if stat.S_ISCHR(st.st_mode) and st.st_uid == os.getuid():
+            return fd
+    except OSError:
+        pass
+    _close(fd)
+    return None
+
+
+def _close(fd):
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def tty_write_fd(fd, data, timeout_s):
+    """Write data to fd, waiting up to timeout_s while the pty queue is full. -> bytes
+    written (a partial count at the deadline or on an error). Never raises."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    view, done = memoryview(data), 0
+    deadline = time.monotonic() + float(timeout_s)
+    while done < len(data) and time.monotonic() < deadline:
+        try:
+            n = os.write(fd, view[done:])
+        except BlockingIOError:
+            n = 0
+        except (OSError, ValueError):
+            break
+        if n > 0:
+            done += n
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            select.select([], [fd], [], remaining)
+        except (OSError, ValueError):
+            break
+    return done
+
+
+def tty_outq_fd(fd):
+    """Bytes queued on the tty that the terminal has not read yet (TIOCOUTQ), or None."""
+    try:
+        buf = fcntl.ioctl(fd, termios.TIOCOUTQ, struct.pack("i", 0))
+        return struct.unpack("i", buf)[0]
+    except (OSError, ValueError, AttributeError, struct.error):
+        return None
+
+
+def tty_outq(tty):
+    fd = tty_open(tty)
+    if fd is None:
+        return None
+    try:
+        return tty_outq_fd(fd)
+    finally:
+        _close(fd)
+
+
+def tty_write_close(fd, data, timeout_s):
+    """tty_write_fd, then close fd whatever happened: the caller hands the fd over."""
+    try:
+        return tty_write_fd(fd, data, timeout_s)
+    finally:
+        _close(fd)
+
+
+def write_tty(tty, data, timeout_s):
+    """Open, write, close: -> bytes written (0 when the tty cannot be opened)."""
+    fd = tty_open(tty)
+    if fd is None:
+        return 0
+    return tty_write_close(fd, data, timeout_s)
+
+
+def proc_stat(pid):
+    """`ps -o stat=` of pid (R, S, T, U...), or None. Never raises."""
+    out = _run(["ps", "-o", "stat=", "-p", str(pid)], timeout=2)
+    return (out or "").strip() or None
 
 
 def parse_foreground(out):
@@ -248,7 +354,8 @@ def identity_alive(pid, pid_start, lookup=None, exists=None):
 
 
 def child_identities(pid):
-    """[(child pid, start epoch)] for the direct children of pid, read before a kill."""
+    """[(child pid, start epoch, comm basename)] for the direct children of pid, read
+    before a kill."""
     out = _run(["ps", "-axo", "pid=,ppid="])
     kids = []
     for line in (out or "").splitlines():
@@ -259,7 +366,7 @@ def child_identities(pid):
             except (ProcsError, ValueError):
                 continue
             if ent:
-                kids.append((int(p[0]), ent[0]))
+                kids.append((int(p[0]), ent[0], os.path.basename(ent[1].strip())))
     return kids
 
 
