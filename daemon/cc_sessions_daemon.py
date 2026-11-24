@@ -1201,10 +1201,15 @@ def _log_skipped(skipped):
         _last_skipped = now
 
 
-async def focus_snapshot(app):
+async def focus_snapshot(app, cache=None, fresh=True):
     """{tty_guid: {tty: guid}, visible_ttys: set, visible_guids: set, panes: int,
-    skipped: int}. Visible = every pane of each window's current tab. The tty reads run
-    concurrently; `skipped` counts panes whose tty read raised an RPCException."""
+    skipped: int, reads: int}. Visible = every pane of each window's current tab. The tty
+    reads run concurrently; `skipped` counts panes whose tty read raised an RPCException.
+    `cache` ({guid: tty}, updated in place): unless `fresh`, only GUIDs it lacks, or that
+    share a tty with another GUID, are read; it keeps exactly the panes now in the model
+    whose tty is known (a failed or empty read is never cached). So on a cached walk
+    `skipped` counts failures among the panes actually read: a pane whose read keeps failing
+    is never cached and is read and counted on every walk, and blindness stays visible."""
     rpc_exc = _rpc_exception()
     panes = []
     for w in app.terminal_windows:
@@ -1213,19 +1218,30 @@ async def focus_snapshot(app):
             shown = cur is not None and t.tab_id == cur.tab_id
             for s in t.sessions:
                 panes.append((s, shown))
+    known = {} if cache is None or fresh else dict(cache)
+    shared = collections.defaultdict(list)
+    for s, _ in panes:
+        if known.get(s.session_id):
+            shared[known[s.session_id]].append(s.session_id)
+    dup = {g for gs in shared.values() if len(gs) > 1 for g in gs}
+    todo = [i for i, (s, _) in enumerate(panes) if s.session_id not in known or s.session_id in dup]
     # return_exceptions: every read finishes (none left running or unretrieved) before the
     # first non-RPCException failure, in pane order, propagates.
     skipped = {}
-    ttys = await asyncio.gather(*[_session_tty(s, rpc_exc, skipped) for s, _ in panes],
-                                return_exceptions=True)
-    for tty in ttys:
+    got = await asyncio.gather(*[_session_tty(panes[i][0], rpc_exc, skipped) for i in todo],
+                               return_exceptions=True)
+    for tty in got:
         if isinstance(tty, BaseException) and not isinstance(tty, rpc_exc):
             raise tty
     _log_skipped(skipped)
+    ttys = [known.get(s.session_id) for s, _ in panes]
+    for i, tty in zip(todo, got):
+        ttys[i] = None if isinstance(tty, BaseException) else tty
+    if cache is not None:
+        cache.clear()
+        cache.update((s.session_id, tty) for (s, _), tty in zip(panes, ttys) if tty)
     tty_guid, visible, vguids = {}, set(), set()
     for (s, shown), tty in zip(panes, ttys):
-        if isinstance(tty, BaseException):
-            tty = None
         if tty:
             tty_guid[tty] = s.session_id
         if shown:
@@ -1233,7 +1249,12 @@ async def focus_snapshot(app):
             if tty:
                 visible.add(tty)
     return {"tty_guid": tty_guid, "visible_ttys": visible, "visible_guids": vguids,
-            "panes": len(panes), "skipped": len(skipped)}
+            "panes": len(panes), "skipped": len(skipped), "reads": len(todo)}
+
+
+def _current_tab_id(w):
+    cur = w.current_tab
+    return cur.tab_id if cur is not None else None
 
 
 def tab_layout(app, tty_guid):
@@ -1261,7 +1282,7 @@ class Daemon(object):
                                  swap_fn=lambda: self.off(procs.swap_pct))
         self.evict_lock = asyncio.Lock()
         self.pass_lock = asyncio.Lock()  # one pressure or idle pass at a time
-        self.sort_lock = asyncio.Lock()  # one tab-sort pass at a time (tick + request)
+        self.sort_lock = asyncio.Lock()  # one tab-sort pass at a time (sort loop + request)
         self.started_at = time.time()
         self.last_fire = {}
         self.last_reap = self.last_prune = 0.0
@@ -1274,6 +1295,19 @@ class Daemon(object):
         self.last_blind_meta = None
         self.instance = None  # this daemon's iTerm2: it exits on any connection loss
         self.gui = None  # loginwindow and WindowServer identities, written into the snapshot
+        self.tty_cache = {}  # guid -> tty: a pane's tty never changes, so it is read once
+        self.tty_full_at = None  # last snapshot that re-read every pane
+        self.walking = None  # future of the full walk running now, if any
+        self.last_ghosts = 0.0
+        # activity-driven tab sort (sort_loop)
+        self.sort_sig = None  # signature of the inputs of the last completed pass
+        self.sort_started_at = 0.0
+        self.win_seen = {}  # window id -> (tab ids, current tab id) at the previous poll
+        self.quiet_until = {}  # window id -> no sort before this (you just switched or moved tabs)
+        # window id -> (tab ids before, tab ids asked for) of the last set_tabs, while the
+        # model still shows the order from before it
+        self.sort_expected = {}
+        self.sort_set = {}  # window id -> tab ids the last pass set
 
     async def off(self, fn, *args):
         """Blocking work (ps, transcript reads, stats) in an executor; SQLite stays here."""
@@ -1282,16 +1316,36 @@ class Daemon(object):
     async def identity(self, row):
         return _as_state(await self.off(procs.identity_probe, row.get("pid"), row.get("pid_start")))
 
-    async def snapshot(self):
+    async def snapshot(self, fresh=False):
         """A slow snapshot on a live connection is a plain TimeoutError, so tick_loop's
-        consecutive-failure rule decides; only a closed websocket is ConnectionLost."""
+        consecutive-failure rule decides; only a closed websocket is ConnectionLost. Panes'
+        ttys come from tty_cache except on the first snapshot, every tty_refresh_s, and with
+        fresh=True, which re-read every pane. One full walk at a time: a snapshot asked for
+        while one runs waits for it, then reads from the cache it left."""
+        waited = False
+        while self.walking is not None:
+            waited = True
+            await asyncio.shield(self.walking)
+        now = time.time()
+        full = (fresh and not waited) or self.tty_full_at is None or \
+            now - self.tty_full_at >= float(self.cfg.get("tty_refresh_s") or 0)
+        done = None
+        if full:
+            done = self.walking = asyncio.get_running_loop().create_future()
         try:
-            focus = await asyncio.wait_for(focus_snapshot(self.app), self.SNAPSHOT_TIMEOUT_S)
+            focus = await asyncio.wait_for(focus_snapshot(self.app, self.tty_cache, full),
+                                           self.SNAPSHOT_TIMEOUT_S)
         except asyncio.TimeoutError:
             what = "iTerm2 did not answer a focus snapshot in %ss" % self.SNAPSHOT_TIMEOUT_S
             if not connection_alive(self.connection):
                 raise ConnectionLost(what)
             raise TimeoutError(what)
+        finally:
+            if done is not None:
+                self.walking = None
+                done.set_result(None)
+        if full:
+            self.tty_full_at = now
         self.record_blindness(focus)
         return focus
 
@@ -1356,26 +1410,35 @@ class Daemon(object):
             log.exception("tab snapshot failed")
             return None
 
+    def sort_mode(self):
+        return str(self.cfg.get("tab_sort") or "off").strip().lower()
+
     async def sort_tabs(self, focus, force=False):
         """Keep every window's tabs in cc-tabs' sort order (pinned, needs you, working,
         the rest by newest activity, non-Claude tabs after), with activity bucketed by
-        tab_sort_bucket_s so the bar only changes when a tab crosses a bucket. Runs each
-        tick when tab_sort is "recent"; force (the tab-sort request) sorts once whatever
-        the config. Reordering moves tabs without selecting one, so no focus event wakes
-        anything. -> a result word for the request log."""
-        mode = str(self.cfg.get("tab_sort") or "off").strip().lower()
-        if not force and mode != "recent":
-            return "tab_sort is %s" % mode
-        async with self.sort_lock:
-            return await self._sort_tabs(focus)
+        tab_sort_bucket_s so the bar only changes when a tab crosses a bucket. sort_loop
+        runs it after activity when tab_sort is "recent"; force (the tab-sort request) sorts
+        once whatever the config, every tab, with no current-tab hold or quiet period.
+        Reordering moves tabs without selecting one, so no focus event wakes anything.
+        -> a result word for the request log."""
+        word, _ = await self.sort_pass(focus, force)
+        return word
 
-    async def _sort_tabs(self, focus):
+    async def sort_pass(self, focus, force=False, now=None):
+        """sort_tabs -> (word, complete). complete: every window was sorted or needed
+        nothing, so the inputs it ran on need no further pass."""
+        if not force and self.sort_mode() != "recent":
+            return "tab_sort is %s" % self.sort_mode(), True
+        async with self.sort_lock:
+            return await self._sort_tabs(focus, force, now)
+
+    async def _sort_tabs(self, focus, force=False, now=None):
         if await self.off(tab_snapshots.restore_running, self.cfg):
-            return "a restore is running"
+            return "a restore is running", False
         # any skipped pane would read as a non-Claude tab and get shoved to the back
         if focus.get("skipped", 0):
-            return "snapshot skipped %d pane(s)" % focus["skipped"]
-        now = time.time()
+            return "snapshot skipped %d pane(s)" % focus["skipped"], False
+        now = time.time() if now is None else now
         states = LIVE_STATES + PARKED_STATES
         rows = ledger.all_rows(self.conn, "ended_at IS NULL AND state IN (%s)" %
                                ",".join("?" * len(states)), states)
@@ -1386,25 +1449,38 @@ class Daemon(object):
         live, parked = tab_snapshots.session_index(rows)
         guid_tty = {g: t for t, g in focus["tty_guid"].items()}
         bucket_s = float(self.cfg.get("tab_sort_bucket_s") or 0)
-        wins = []
+        wins, complete = [], True
+        self.sort_set = {}
         for w in self.app.terminal_windows:
             tabs = list(w.tabs)
             if len(tabs) < 2:
                 continue
+            if not force and now < self.quiet_until.get(w.window_id, 0):
+                complete = False
+                continue
+            cur = None if force else _current_tab_id(w)
             tab_rows = []
             for t in tabs:
                 matched = [tab_snapshots.pane_row(
                     {"guid": s.session_id, "tty": guid_tty.get(s.session_id)}, live, parked)
                     for s in t.sessions]
                 tab_rows.append([r for r in matched if r])
-            wins.append((w, tabs, tab_rows))
+            wins.append((w, tabs, tab_rows, cur))
         if not wins:
-            return "moved 0 tab(s)"
-        orders = await self.off(self._tab_orders, [trs for _, _, trs in wins],
+            return "moved 0 tab(s)", complete
+        orders = await self.off(self._tab_orders, [trs for _, _, trs, _ in wins],
                                 times, doc, bucket_s, now)
         moved = 0
-        for (w, tabs, _), order in zip(wins, orders):
+        for (w, tabs, _, cur), order in zip(wins, orders):
+            ids = [t.tab_id for t in tabs]
+            if cur is not None and cur in ids:
+                order = tabsort.hold_current(order, ids.index(cur))
             if order == list(range(len(tabs))):
+                continue
+            want = [ids[i] for i in order]
+            # set_tabs went out and the model still shows the order from before it: nothing to
+            # do again. A forced sort never trusts that (a notification may have been lost).
+            if not force and self.sort_expected.get(w.window_id) == (ids, want):
                 continue
             n = sum(1 for pos, i in enumerate(order) if pos != i)
             if self.dry_run:
@@ -1412,25 +1488,126 @@ class Daemon(object):
                 continue
             # the executor pass took time: a window the user changed meanwhile is skipped,
             # or async_set_tabs would move a torn-off tab back (and close its new window)
-            if [t.tab_id for t in w.tabs] != [t.tab_id for t in tabs]:
+            if [t.tab_id for t in w.tabs] != ids:
                 log.info("tab sort: window %s changed during the pass; skipped", w.window_id)
+                complete = False
+                continue
+            if not force and _current_tab_id(w) != cur:
+                log.info("tab sort: window %s switched tabs during the pass; skipped", w.window_id)
+                complete = False
                 continue
             await iterm_call(w.async_set_tabs([tabs[i] for i in order]), "set_tabs")
+            self.sort_set[w.window_id] = want
+            if [t.tab_id for t in w.tabs] == want:
+                # the model shows it already: the next poll compares against this order
+                self.sort_expected.pop(w.window_id, None)
+                self.win_seen[w.window_id] = (want, _current_tab_id(w))
+            else:
+                self.sort_expected[w.window_id] = (ids, want)
             moved += n
         if moved:
             log.info("tab sort moved %d tab(s)", moved)
-        return "moved %d tab(s)" % moved
+        return "moved %d tab(s)" % moved, complete
 
     def _tab_orders(self, window_tab_rows, times, doc, bucket_s, now):
         """The blocking half of a sort, one pass for every window (work_reason and the
-        activity fallback read transcripts and ps): executor work, no SQLite."""
+        activity fallback read transcripts and ps): executor work, no SQLite. A parked row
+        (evicting, hibernated, resuming) is never Working, whatever its children say."""
         rows = [r for trs in window_tab_rows for tab in trs for r in tab]
         activity.fill_transcript_activity(self.cfg, rows, times)
         facts = Facts(self.cfg, now)
 
         def work(row):
+            if row.get("state") in PARKED_STATES:
+                return None
             return activity.work_reason(row, now, self.cfg, facts.analysis, facts.children)
         return [tabsort.order(trs, times, doc, work, bucket_s) for trs in window_tab_rows]
+
+    def observe_windows(self, now):
+        """Once per sort poll: a window whose current tab changed since the previous poll, or
+        whose tab order changed in a way set_tabs did not ask for (a drag, a new or closed
+        tab), is quiet for tab_sort_quiet_s. An expectation ends once the model shows anything
+        but the order from before set_tabs: the order asked for, or whatever you made it."""
+        quiet_s = float(self.cfg.get("tab_sort_quiet_s") or 0)
+        seen = {}
+        for w in self.app.terminal_windows:
+            wid, ids, cur = w.window_id, [t.tab_id for t in w.tabs], _current_tab_id(w)
+            exp = self.sort_expected.get(wid)
+            want = exp[1] if exp else None
+            if exp and ids != exp[0]:
+                del self.sort_expected[wid]
+            prev = self.win_seen.get(wid)
+            if prev is not None:
+                moved = ids != prev[0] and ids != want
+                if (moved or cur != prev[1]) and quiet_s > 0:
+                    self.quiet_until[wid] = now + quiet_s
+            seen[wid] = (ids, cur)
+        self.win_seen = seen
+        for wid in [k for k in self.quiet_until if k not in seen]:
+            del self.quiet_until[wid]
+        for wid in [k for k in self.sort_expected if k not in seen]:
+            del self.sort_expected[wid]
+
+    def _shown_ids(self, wid, ids):
+        """The window's tab ids, or the order set_tabs asked for while the model still shows
+        the order from before it."""
+        exp = self.sort_expected.get(wid)
+        return list(exp[1]) if exp and ids == exp[0] else ids
+
+    def sort_signature(self, now):
+        """Everything a sort pass reads, cheaply and with no iTerm2 RPC: the newest event id
+        and the un-ended rows' (state, subagents), the groups file's mtime and size, every
+        window's tab order (the order set_tabs asked for while the model lags) and current
+        tab, and a slot of tab_sort_recheck_s for what no signature can see (background work
+        ending, stale_busy, activity crossing a bucket)."""
+        top, rows = ledger.sort_inputs(self.conn)
+        try:
+            st = os.stat(tabgroups.path(self.cfg))
+            groups = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            groups = None
+        wins = tuple((w.window_id, tuple(self._shown_ids(w.window_id, [t.tab_id for t in w.tabs])),
+                      _current_tab_id(w)) for w in self.app.terminal_windows)
+        every = float(self.cfg.get("tab_sort_recheck_s") or 0)
+        return (top, rows, groups, wins, int(now // every) if every > 0 else 0)
+
+    async def sort_poll(self, now=None):
+        """One sort_loop step. The signature is taken before the pass reads anything, so
+        activity during a pass makes another; it is kept only when the pass completed (not
+        when a restore ran, panes were skipped, or a window was deferred or changed).
+        -> a word for tests."""
+        if self.sort_mode() != "recent":
+            return "off"
+        now = time.time() if now is None else now
+        self.observe_windows(now)
+        sig = self.sort_signature(now)
+        if sig == self.sort_sig:
+            return "unchanged"
+        if now - self.sort_started_at < float(self.cfg.get("tab_sort_min_interval_s") or 0):
+            return "too soon"
+        sortable = [w for w in self.app.terminal_windows if len(w.tabs) >= 2]
+        if sortable and all(now < self.quiet_until.get(w.window_id, 0) for w in sortable):
+            return "quiet"
+        self.sort_started_at = now
+        _, complete = await self.sort_pass(await self.snapshot(), now=now)
+        if complete:
+            top, rows, groups, wins, slot = sig
+            self.sort_sig = (top, rows, groups, tuple(
+                (wid, tuple(self.sort_set.get(wid) or self._shown_ids(wid, list(ids))), cur)
+                for wid, ids, cur in wins), slot)
+        return "sorted" if complete else "incomplete"
+
+    async def sort_loop(self):
+        """The activity-driven tab sort, every REQUEST_POLL_S. A sort bug is logged and never
+        ends the daemon; only a lost iTerm2 connection does."""
+        while True:
+            try:
+                await self.sort_poll()
+            except ConnectionLost:
+                raise
+            except Exception:
+                log.exception("tab sort failed")
+            await asyncio.sleep(REQUEST_POLL_S)
 
     def heartbeat(self):
         now = time.time()
@@ -1516,7 +1693,23 @@ class Daemon(object):
                 return "tab changed"
             check = dict(fresh, state=r["state"], state_since=r.get("state_since"))
             _, k2, _, _ = await self.policy(focus2, rows=[check], explicit=explicit, cfg=policy_cfg)
-            return k2[0][1] if k2 else None
+            if k2:
+                return k2[0][1]
+            # the snapshot's ttys are cached: ask this one tab now, right before the signal. A
+            # stall or error here keeps the session (the tick decides about the connection).
+            guid = r["iterm_guid_now"]
+            try:
+                raw = await asyncio.wait_for(self.evictor.tabs.tty(guid), ITERM_CALL_TIMEOUT_S)
+            except Exception as exc:  # a timeout, an RPC error or ConnectionLost
+                log.warning("evict %s: tab tty unreadable at the re-check: %s", r["session_id"][:8],
+                            str(exc) or type(exc).__name__)
+                return "tab tty unreadable"
+            now_tty = procs.norm_tty(raw)
+            if now_tty != fresh.get("tty"):
+                return "tab tty is now %s" % now_tty
+            if await self.evictor.tabs.is_visible(guid):
+                return "tab became visible"
+            return None
 
         with ledger.tx(self.conn):
             if row["iterm_guid_now"]:
@@ -1594,15 +1787,10 @@ class Daemon(object):
                 self.evictor.sweep_hooks(now)
             except Exception:
                 log.exception("on_evict sweep failed; retried next tick")
+        await self.reconcile_ghosts(now)
         focus = await self.snapshot()
         await self.write_tab_snapshot(focus, now)
         self.stamp_visibility(focus, now)
-        try:
-            await self.sort_tabs(focus)
-        except ConnectionLost:
-            raise
-        except Exception:
-            log.exception("tab sort failed")
         if now - self.last_reap > REAP_EVERY_S:
             from ccsessions import cli
             removed, _ = await self.off(functools.partial(cli.reap, self.cfg, dry_run=self.dry_run,
@@ -1621,6 +1809,35 @@ class Daemon(object):
                     await self.pressure.relieve(free, one, swap=swap)
             await self.idle_pass(free)
         self.heartbeat()  # only after a tick that completed
+
+    async def reconcile_ghosts(self, now=None):
+        """Every ghost_reconcile_s: a non-interactive row still idle, busy or waiting with no
+        hook event for ghost_min_age_s whose exact process is GONE is ended (a headless run
+        that died without SessionEnd). UNKNOWN, a row without an identity, and every
+        interactive row (restore owns those) are left alone. Best effort. -> ended sids."""
+        now = time.time() if now is None else now
+        every = float(self.cfg.get("ghost_reconcile_s") or 0)
+        if every <= 0 or now - self.last_ghosts < every:
+            return []
+        self.last_ghosts = now
+        ended = []
+        try:
+            rows = ledger.ghost_candidates(self.conn, now - float(self.cfg.get("ghost_min_age_s") or 0))
+            if not rows:
+                return ended
+            probes = await self.off(probe_rows, rows)
+            for r in rows:
+                if _as_state(probes.get(r["session_id"], procs.UNKNOWN)) != procs.GONE:
+                    continue
+                if self.dry_run:
+                    log.info("DRY RUN would end %s: process gone, %s", r["session_id"][:8], r["state"])
+                    continue
+                if ledger.end_ghost(self.conn, r, now):
+                    ended.append(r["session_id"])
+                    log.info("reconcile %s: process gone, %s -> ended", r["session_id"][:8], r["state"])
+        except Exception:
+            log.exception("ghost reconcile failed; retried in %ss", every)
+        return ended
 
     async def idle_pass(self, free):
         """Hibernate sessions in state idle for idle_hibernate_min, whatever the memory: the
@@ -1702,7 +1919,7 @@ class Daemon(object):
             # queued while no daemon ran: a surprise reorder at daemon start helps nobody
             if (req.get("ts") or 0) < self.started_at:
                 return "expired"
-            return await self.sort_tabs(await self.snapshot(), force=True)
+            return await self.sort_tabs(await self.snapshot(fresh=True), force=True)
         if kind == "title":  # first: a restore queues one per typed tab, none needs free memory
             row = ledger.get(self.conn, sid)
             return await self.title_tab(row, req.get("ts")) if row else "unknown session"
@@ -1896,9 +2113,9 @@ class Daemon(object):
                     log.exception("focus handler failed")
 
     async def run_loops(self, loops=None):
-        """Run focus, tick and request loops; the first one to fail cancels the others and
+        """Run the focus, tick, request and sort loops; the first one to fail cancels the others and
         its exception propagates, so main() exits for a clean restart instead of hanging."""
-        coros = loops or (self.focus_loop(), self.tick_loop(), self.request_loop())
+        coros = loops or (self.focus_loop(), self.tick_loop(), self.request_loop(), self.sort_loop())
         tasks = [asyncio.ensure_future(c) for c in coros]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)

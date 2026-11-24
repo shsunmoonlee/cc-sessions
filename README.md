@@ -31,7 +31,7 @@ writes focus, evictions, requests and its heartbeat. Everything else only reads.
 | `idle` | SessionStart, Stop, StopFailure (any error but `rate_limit`), Notification `idle_prompt` (when no subagents run and no usage-limit hold), `quota_auto_resume_stale` / `_disabled` |
 | `busy` | UserPromptSubmit, Notification `quota_auto_resume_fired`; a StopFailure with `error: rate_limit` (the account's usage limit, an automatic resume pending) keeps the session busy for up to 26 h |
 | `waiting` | Notification `permission_prompt` / `elicitation_dialog` |
-| `ended` | SessionEnd |
+| `ended` | SessionEnd; the daemon, for a non-interactive row whose process is gone with no SessionEnd (`end_reason` `gone`) |
 | `evicting` -> `hibernated` | the daemon, then SessionEnd (or the daemon after the grace period) |
 | `resuming` | cc-resume / the daemon, until SessionStart(resume) turns it `idle` |
 | `superseded` | SessionStart in the same process under a new id (`/clear`, in-app `/resume`) |
@@ -187,6 +187,15 @@ last, as they were. Activity is the newest prompt, turn end or finished subagent
 session's start or resume. A pinned, waiting or working tab stays in that section even when
 grouped. It does not change the selected tab, so it wakes nothing. `--all` sorts every window.
 
+With `tab_sort` set to `recent` the daemon keeps that order by itself. It checks every 5 s,
+with no iTerm2 call, whether anything a sort reads has changed: a hook event, a session's
+state, the groups file, a window's tabs or current tab, or a `tab_sort_recheck_s` slot passing
+(10 min, for what it cannot see, such as background work ending). Only then does it sort, at
+most once per `tab_sort_min_interval_s`, so a prompt or a turn end moves its tab within about
+10 s and an idle machine sorts at most once per recheck slot. The tab you are on keeps its
+place, and a window is left alone for `tab_sort_quiet_s` after you switch or drag tabs in it.
+The menu's Sort, `cc-tabs sort`, still sorts everything at once.
+
 **Find** (`Find session`, ⌃⌥⌘F): search by title, group or folder. Enter selects the tab, which
 wakes a hibernated session, or wakes it in a new tab if its tab is gone.
 
@@ -261,6 +270,13 @@ path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file tha
 | `tab_snapshots_dir` | `cc-sessions-tabs` beside the ledger | tab snapshots (`~/.claude/state/cc-sessions-tabs` with the default ledger) |
 | `iterm_alone_check_s` | 30 | after losing iTerm2, how long before deciding it went down alone |
 | `groups_file` | `cc-sessions-groups.json` beside the ledger | manual groups and pins |
+| `tab_sort` | `off` | `recent`: the daemon keeps tabs in sort order after activity (see Tabs) |
+| `tab_sort_bucket_s` | 600 | tabs swap places by recency only across buckets this wide (0 = raw recency) |
+| `tab_sort_min_interval_s` | 10 | at most one automatic sort this often |
+| `tab_sort_quiet_s` | 10 | no sort of a window this long after you switch or move tabs in it |
+| `tab_sort_recheck_s` | 600 | an automatic sort this often even with no activity seen |
+| `tty_refresh_s` | 600 | every pane's tty is re-read this often; in between only new tabs are read |
+| `ghost_reconcile_s` / `ghost_min_age_s` | 600 / 600 | how often the daemon ends non-interactive rows whose process is gone, once they have had no event this long |
 | `low_free_pct` / `high_free_pct` | 20 / 35 | evict below, stop at |
 | `swap_high_pct` | 75 | swap used % that counts as memory pressure (0 = off) |
 | `idle_min` | 10 | minutes idle, unfocused and without file activity |

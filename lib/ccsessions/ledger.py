@@ -619,6 +619,44 @@ def mark_restored(conn, sid, guid, tty=None, now=None, seen=None):
         return conn.execute(sql, args).rowcount
 
 
+GHOST_STATES = (IDLE, BUSY, WAITING)
+
+
+def ghost_candidates(conn, older_than):
+    """Non-interactive live rows with a process identity and no hook event since
+    `older_than`: the rows reconcile_ghosts probes. NULL interactive counts as interactive."""
+    q = ",".join("?" * len(GHOST_STATES))
+    return all_rows(conn, "ended_at IS NULL AND interactive = 0 AND state IN (%s) AND pid IS NOT NULL "
+                    "AND pid_start IS NOT NULL AND COALESCE(last_event_at, 0) < ?" % q,
+                    GHOST_STATES + (older_than,))
+
+
+def end_ghost(conn, row, now=None):
+    """A non-interactive row whose process is gone -> ended (end_reason 'gone'), only if the
+    row still has the state, last event and process identity it was read with. -> bool."""
+    now = time.time() if now is None else now
+    sid = row["session_id"]
+    with tx(conn):
+        cur = conn.execute("UPDATE sessions SET state=?, state_since=?, ended_at=?, end_reason='gone' "
+                           "WHERE session_id=? AND ended_at IS NULL AND interactive = 0 AND state=? "
+                           "AND last_event_at IS ? AND pid IS ? AND pid_start IS ?",
+                           (ENDED, now, now, sid, row.get("state"), row.get("last_event_at"),
+                            row.get("pid"), row.get("pid_start")))
+        if cur.rowcount:
+            add_event(conn, sid, "ghost-ended", {"state": row.get("state")}, now)
+        return cur.rowcount == 1
+
+
+def sort_inputs(conn):
+    """(newest events.id, a fingerprint of (session_id, state, subagents) over un-ended rows):
+    the ledger half of the tab sort's signature. Daemon state changes that write no event
+    (mark_hibernated, reconcile, expire_resuming) move the fingerprint."""
+    top = conn.execute("SELECT MAX(id) FROM events").fetchone()[0]
+    rows = conn.execute("SELECT session_id, state, subagents FROM sessions WHERE ended_at IS NULL "
+                        "ORDER BY session_id").fetchall()
+    return top, hash(tuple(tuple(r) for r in rows))
+
+
 def set_guid(conn, sid, guid):
     with tx(conn):
         conn.execute("UPDATE sessions SET iterm_guid=? WHERE session_id=? AND "
