@@ -60,12 +60,25 @@ DEFAULTS = {
     "iterm_alone_check_s": 30,
     # null = cc-sessions-groups.json beside the ledger
     "groups_file": None,
-    # "recent": the daemon keeps every window's tabs in cc-tabs' sort order each tick
-    # (pinned, needs you, working, the rest by newest activity); "off" = never by itself
+    # "recent": the daemon keeps every window's tabs in cc-tabs' sort order (pinned, needs
+    # you, working, the rest by newest activity), re-sorting after activity; "off" = never
+    # by itself
     "tab_sort": "off",
     # tabs swap places by recency only across buckets this many seconds wide, so the
     # tab bar never dances on every hook event (0 = raw recency)
     "tab_sort_bucket_s": 600,
+    # at most one activity-driven sort pass this often
+    "tab_sort_min_interval_s": 10,
+    # a window is not sorted this long after you switch tabs or move a tab in it
+    "tab_sort_quiet_s": 10,
+    # a sort pass this often even with no activity seen (ages, background work ending)
+    "tab_sort_recheck_s": 600,
+    # every pane's tty is re-read over the API this often; in between only new tabs are
+    "tty_refresh_s": 600,
+    # how often the daemon ends non-interactive rows whose process is gone
+    "ghost_reconcile_s": 600,
+    # ... once they have had no hook event for this long
+    "ghost_min_age_s": 600,
     # What gets typed into a tab to resume a session. null = the cc-resume installed
     # next to this package (bin/cc-resume).
     "resume_command": None,

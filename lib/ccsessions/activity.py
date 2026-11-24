@@ -158,9 +158,30 @@ def _record_is_work(d):
     return bool(text) and not text.startswith(NOT_TYPED_PREFIXES)
 
 
+_WORK_MEMO = {}  # path -> ((inode, size, mtime_ns, chunk, limit), answer)
+WORK_MEMO_MAX = 2048
+
+
 def last_work_time(path, chunk=TAIL_CHUNK, limit=TAIL_LIMIT):
     """When this transcript last held real work, read from the end. None when none turns up
-    within `limit` bytes or the file can't be read."""
+    within `limit` bytes or the file can't be read. Memoized by the file's inode, size and
+    mtime: a sort pass asks for every tab's transcript, and most have not changed."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_ino, st.st_size, st.st_mtime_ns, chunk, limit)
+    hit = _WORK_MEMO.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    ts = _read_last_work_time(path, chunk, limit)
+    if len(_WORK_MEMO) >= WORK_MEMO_MAX:
+        _WORK_MEMO.clear()
+    _WORK_MEMO[path] = (key, ts)
+    return ts
+
+
+def _read_last_work_time(path, chunk, limit):
     try:
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)

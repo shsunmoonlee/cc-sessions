@@ -2,10 +2,10 @@
 
 The order is cc-tabs' (activity.tab_info / sort_order: pinned, needs you, working, then
 the rest by newest activity with a group's members together, non-Claude tabs after), but
-activity is quantized into tab_sort_bucket_s buckets first: a pass that runs every tick
-must only move a tab when it crosses a bucket, never reshuffle the bar on every hook
-event. Within a bucket the current order stands (both sorts are stable). Pure: callers
-do the iTerm2 I/O."""
+activity is quantized into tab_sort_bucket_s buckets first: a pass that runs after each
+burst of activity must only move a tab when it crosses a bucket, never reshuffle the bar
+on every hook event. Within a bucket the current order stands (both sorts are stable).
+Pure: callers do the iTerm2 I/O."""
 from . import activity, tabgroups
 
 
@@ -29,3 +29,13 @@ def order(tab_rows, events, doc, work_fn, bucket_s):
                                lambda s: tabgroups.is_pinned(doc, s), work_fn)
              for rows in tab_rows]
     return activity.sort_order(quantized(infos, bucket_s))
+
+
+def hold_current(order, current):
+    """`order` with the tab at index `current` put back at its own position, the others in
+    policy order around it: the tab you are on never moves. current None = no hold."""
+    if current is None or current not in order:
+        return list(order)
+    rest = [i for i in order if i != current]
+    pos = min(current, len(rest))
+    return rest[:pos] + [current] + rest[pos:]
