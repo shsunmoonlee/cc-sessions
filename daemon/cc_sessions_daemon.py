@@ -279,6 +279,18 @@ def resume_decision(row, guid, tty, now, last_fire, job, identity_alive):
     return None
 
 
+def zz_title(title):
+    """The name of a hibernated tab, the same for eviction and restore (fits TITLE_MAX whole,
+    so set_name and the OSC title always carry the identical string)."""
+    return ("[zz] " + tab_snapshots.clean_title(title))[:tab_snapshots.TITLE_MAX]
+
+
+def osc_title(name):
+    """OSC 0: the tab title as the terminal stream sets it. On iTerm2 3.7 an empty OSC title
+    (a program clearing its title on exit) hides async_set_name's name; an OSC title wins."""
+    return "\x1b]0;%s\x07" % tab_snapshots.clean_title(name)
+
+
 def is_shell_job(job):
     return job in procs.SHELL_JOBS
 
@@ -761,22 +773,31 @@ class Evictor(object):
         # (the claude binary is named after its version; MCP children linger), and a tab left
         # unnamed shows "-zsh" instead of the hibernated title. Focus resumes it later, once
         # jobName reads as a shell (resume_decision refuses any other job).
-        await self.tabs.set_name(guid, "[zz] %s" % title)
+        # set_name alone can lose to the dead process's own title reset (an empty OSC 0): the
+        # name also goes through the tty, after everything that process wrote
+        name = zz_title(title)
+        await self.tabs.set_name(guid, name)
         if not is_shell_job(job):
             log.warning("evict %s: tab is not at a shell after %.0fs (%s); named, nothing typed",
                         sid, waited, job)
+            # a program may own the terminal: the title only, no reset and no banner, and no
+            # inject when the tty write fails (this path never puts anything in the tab itself)
+            if not self._still_hibernated(row, "before the title"):
+                return False
+            await self.write_banner(sid, guid, row.get("tty"), held, osc_title(name), what="title",
+                                    fallback=False)
             return False
         banner = "%s\r\n\x1b[2m[cc-sessions] %s: hibernated to free memory; transcript intact.\r\n" \
-                 "  press Enter to resume here\x1b[0m\r\n" % (TTY_RESET, title)
+                 "  press Enter to resume here\x1b[0m\r\n" % (TTY_RESET, tab_snapshots.clean_title(title))
         if not self._still_hibernated(row, "before the banner"):
             return False
-        await self.write_banner(sid, guid, row.get("tty"), held, banner)
+        await self.write_banner(sid, guid, row.get("tty"), held, banner + osc_title(name))
         if not self._still_hibernated(row, "before typing"):
             return False
         await self.tabs.send_text(guid, resumecmd.command(self.cfg, row["session_id"], row.get("cwd")))
         return True
 
-    async def write_banner(self, sid, guid, tty, held, banner):
+    async def write_banner(self, sid, guid, tty, held, banner, what="banner", fallback=True):
         """Through the tty device: queued behind whatever the dead process wrote last, which
         iTerm2's inject is not. Falls back to inject only when no byte got out; a partial
         write is left as is (injecting would repeat or truncate it). The fd in held[0] is
@@ -793,16 +814,20 @@ class Evictor(object):
             return
         if n > 0:
             reset = len((procs.TTY_ABORT + TTY_RESET).encode("utf-8"))
-            log.warning("evict %s: tty write got %d of %d bytes out; banner left partial%s",
-                        sid, n, len(payload), ", reset incomplete" if n < reset else "")
+            log.warning("evict %s: tty write got %d of %d bytes out; %s left partial%s",
+                        sid, n, len(payload), what,
+                        ", reset incomplete" if what == "banner" and n < reset else "")
             return
         if fd is not None:
             try:
                 outq = await self._call(procs.tty_outq, tty)
             except Exception:
                 outq = None
-        log.warning("evict %s: tty write got 0 bytes out (outq=%s); banner injected through iTerm2",
-                    sid, outq)
+        if not fallback:
+            log.warning("evict %s: tty write got 0 bytes out (outq=%s); %s not written", sid, outq, what)
+            return
+        log.warning("evict %s: tty write got 0 bytes out (outq=%s); %s injected through iTerm2",
+                    sid, outq, what)
         await self.tabs.inject(guid, banner.encode("utf-8"))
 
     def _still_hibernated(self, row, when):
@@ -1967,11 +1992,11 @@ class Daemon(object):
             if requested_at and time.time() - requested_at < TITLE_RETRY_S:
                 return REQUEST_RETRY
             return "tab is running %s" % job
-        name = "[zz] %s" % tab_snapshots.clean_title(await self.resume_title(row))
+        name = zz_title(await self.resume_title(row))
         if self.dry_run:
             log.info("DRY RUN would title %s %r", row["session_id"][:8], name)
             return "dry-run"
-        await self.tabs.inject(guid, ("\x1b]0;%s\x07" % name).encode("utf-8"))
+        await self.tabs.inject(guid, osc_title(name).encode("utf-8"))
         await self.tabs.set_name(guid, name)
         return "titled"
 
