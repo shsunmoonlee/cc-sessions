@@ -372,9 +372,13 @@ def restore_running(cfg):
         fh.close()
 
 
+TITLE_MAX = 200
+
+
 def clean_title(title):
-    """A title safe to put inside an OSC sequence: printable characters only."""
-    return "".join(c for c in str(title or "") if c.isprintable())
+    """A title safe to put inside an OSC sequence: printable characters only (no ESC, BEL,
+    C0/C1 control or DEL can end the sequence or start another), at most TITLE_MAX."""
+    return "".join(c for c in str(title or "") if c.isprintable())[:TITLE_MAX]
 
 
 def when(t):

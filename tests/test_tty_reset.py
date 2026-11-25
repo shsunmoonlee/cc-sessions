@@ -340,7 +340,8 @@ class BannerThroughTheTty(TempEnv):
         tabs = FakeTabs(["vim"])
         arun(self.evictor(tabs).evict(self.row, 12, 1.0))
         self.assertEqual(self.kinds(tabs), ["name"])
-        self.assertEqual(self.writes, [])
+        # the tab title only (dotclaude#166): no reset, no banner
+        self.assertEqual([w[1] for w in self.writes], [(procs.TTY_ABORT + "\x1b]0;[zz] Title\x07").encode()])
         self.assertTrue(self.pipe.write_end_closed())
 
     def test_the_fd_is_closed_when_the_tab_call_raises(self):
