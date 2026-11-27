@@ -325,7 +325,7 @@ def row_refusal(row, now, days, entry, activity, probe):
 
 
 def idle_estimate(conn, doc, days, now, guids_fn, cfg=None):
-    """About how many tabs close-idle would close, for the menu's minute refresh: no cookie, no
+    """About how many tabs close-idle would close, for the menu's refresh: no cookie, no
     websocket, no iterm2 import. It cannot see the selected tab, a split or the foreground job,
     so it can read high; a click gets the exact number from a dry run. guids_fn runs only when
     a row qualifies, and returns the live tab GUIDs or None. -> count, None when not asked."""

@@ -14,13 +14,18 @@ local CLI = HOME .. "/.claude/bin/cc-sessions"
 local TABS = HOME .. "/.claude/bin/cc-tabs"
 local LOG = HOME .. "/Library/Logs/cc-sessions.log"
 local PREVIEW = HOME .. "/Library/Logs/cc-sessions-restore-preview.log"
-local REFRESH_EVERY = 60
 local OLDER_SHOWN = 5
 local CLOSE_DAYS = 7
 local HYPER = { "ctrl", "alt", "cmd" }
 local FIND_KEY, SORT_KEY = "F", "S"
 local HYPER_TEXT = "⌃⌥⌘"
 local ASK_KEY = "cc_sessions.ask_iterm"
+local ITERM_BUNDLE = "com.googlecode.iterm2"
+local AFTER_LAUNCH = { 10, 45, 240 }
+local AFTER_QUIT = { 5, 30, 120 }
+local RESTORING_EVERY = 15
+local STUCK_AFTER = 60
+local RESTORING_MAX_FAILS = 8
 local COLORS = {
   { "Red", "#d0453c" }, { "Orange", "#e0822d" }, { "Yellow", "#d9b62c" }, { "Green", "#4ca14f" },
   { "Blue", "#3f7fd6" }, { "Purple", "#8a56c9" }, { "Pink", "#d6609f" }, { "Gray", "#808890" },
@@ -74,32 +79,113 @@ local function render()
   M.menu:setTitle(hs.styledtext.new(text, { font = hs.styledtext.defaultFonts.menuBar }))
 end
 
--- The minute refresh never connects to iTerm2's API: no cookie, no websocket, no iterm2 import.
+-- A refresh runs on events, never on a timer: at start, when iTerm2 quits or launches, when the
+-- Mac wakes or unlocks, when the menu opens, and after the menu's own actions. One runs at a time;
+-- a request while one is in flight runs once more after it. One in flight STUCK_AFTER seconds or
+-- more is given up: a new one starts, and the old one's late callbacks change nothing.
+-- While a restore runs (one this menu did not start, too) it refreshes every RESTORING_EVERY
+-- seconds until the restore ends, so the title does not stay at "cc ...", and gives up after
+-- RESTORING_MAX_FAILS failed polls in a row.
+-- It never connects to iTerm2's API: no cookie, no websocket, no iterm2 import.
 -- Its one AppleScript call (the live tab list) waits for the first time the owner uses this menu,
 -- so the Automation prompt answers a click instead of appearing when Hammerspoon loads.
+local inflight, again, gen, began, fails = 0, false, 0, 0, 0
+local refreshDone
+
 local function refresh()
+  local now = hs.timer.secondsSinceEpoch()
+  if inflight > 0 and now - began < STUCK_AFTER then
+    again = true
+    return
+  end
+  gen, inflight, began = gen + 1, 2, now
+  local mine = gen
+  local function done()
+    if mine == gen then refreshDone() end
+  end
   local args = { "tabs", "--json", "--idle-days", tostring(CLOSE_DAYS) }
   if not hs.settings.get(ASK_KEY) then table.insert(args, "--no-ask") end
   run(args, function(code, out)
-    if code ~= 0 then return end
-    local ok, d = pcall(hs.json.decode, out)
-    if not ok or type(d) ~= "table" then return end
-    st.known = d.pending_known == true
-    st.pending = tonumber(d.pending) or 0
-    st.time = d.pending_time or ""
-    st.path = d.pending_path or ""
-    st.dismissed = d.pending_dismissed == true
-    st.restoring = d.restoring == true
-    st.snapshots = d.snapshots or {}
-    st.idleTabs = tonumber(d.idle_tabs) or 0
-    st.idleKnown = d.idle_tabs_known == true
-    render()
+    local ok, d = false, nil
+    if code == 0 then ok, d = pcall(hs.json.decode, out) end
+    local good = ok and type(d) == "table"
+    if mine == gen and good then
+      fails = 0
+      pcall(function()
+        st.known = d.pending_known == true
+        st.pending = tonumber(d.pending) or 0
+        st.time = d.pending_time or ""
+        st.path = d.pending_path or ""
+        st.dismissed = d.pending_dismissed == true
+        st.restoring = d.restoring == true
+        st.snapshots = d.snapshots or {}
+        st.idleTabs = tonumber(d.idle_tabs) or 0
+        st.idleKnown = d.idle_tabs_known == true
+        render()
+      end)
+    elseif mine == gen then
+      fails = fails + 1
+    end
+    if mine == gen then
+      pcall(function()
+        if M.restoreTimer then M.restoreTimer:stop() end
+        local poll = st.restoring and fails < RESTORING_MAX_FAILS
+        M.restoreTimer = poll and hs.timer.doAfter(RESTORING_EVERY, refresh) or nil
+      end)
+    end
+    done()
   end)
   runTabs({ "group", "list", "--json" }, function(code, out)
-    if code ~= 0 then return end
-    local ok, d = pcall(hs.json.decode, out)
-    if ok and type(d) == "table" then st.groups = d end
+    if code == 0 and mine == gen then
+      pcall(function()
+        local ok, d = pcall(hs.json.decode, out)
+        if ok and type(d) == "table" then st.groups = d end
+      end)
+    end
+    done()
   end)
+end
+
+refreshDone = function()
+  inflight = inflight - 1
+  if inflight == 0 and again then
+    again = false
+    refresh()
+  end
+end
+
+-- Each iTerm2 event also refreshes a few times later. A quit: its Claude processes take a moment
+-- to die, and a still-running one is not counted as pending. A launch: the new instance restores
+-- its tabs over time, the daemon reconnects, and a login `restore --auto` can wait up to 180 s.
+-- A launch replaces only pending launch follow-ups and a quit only quit ones, so an old instance
+-- dying after its replacement launched keeps the launch's.
+local function cancelLater(kind)
+  M.later = M.later or {}
+  for k, list in pairs(M.later) do
+    if kind == nil or k == kind then
+      for _, t in ipairs(list) do t:stop() end
+      M.later[k] = nil
+    end
+  end
+end
+
+local function onITerm(_, event, app)
+  if not app or app:bundleID() ~= ITERM_BUNDLE then return end
+  local A = hs.application.watcher
+  if event ~= A.launched and event ~= A.terminated then return end
+  local kind = event == A.launched and "launch" or "quit"
+  cancelLater(kind)
+  refresh()
+  local list = {}
+  for _, s in ipairs(event == A.launched and AFTER_LAUNCH or AFTER_QUIT) do
+    table.insert(list, hs.timer.doAfter(s, refresh))
+  end
+  M.later[kind] = list
+end
+
+local function onPower(event)
+  local C = hs.caffeinate.watcher
+  if event == C.systemDidWake or event == C.screensDidUnlock then refresh() end
 end
 
 -- -> true the first time ever.
@@ -298,6 +384,7 @@ local function buildMenu()
   local items = {}
   local working = busy or st.restoring
   local firstOpen = allowAsking()
+  if not firstOpen then refresh() end
   if not st.known then
     table.insert(items, {
       title = firstOpen and "Asking iTerm2 for its tabs..." or "iTerm2 could not be asked: restore unavailable",
@@ -358,9 +445,15 @@ function M.start()
   end)
   M.chooser:searchSubText(true)
   M.hotkeys = { hs.hotkey.bind(HYPER, FIND_KEY, openPicker), hs.hotkey.bind(HYPER, SORT_KEY, sortTabs) }
+  cancelLater()
+  if M.restoreTimer then M.restoreTimer:stop() end
+  M.restoreTimer = nil
+  if M.appWatcher then M.appWatcher:stop() end
+  if M.wakeWatcher then M.wakeWatcher:stop() end
   render()
   refresh()
-  M.timer = hs.timer.doEvery(REFRESH_EVERY, refresh)
+  M.appWatcher = hs.application.watcher.new(onITerm):start()
+  M.wakeWatcher = hs.caffeinate.watcher.new(onPower):start()
 end
 
 return M
