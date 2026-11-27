@@ -332,8 +332,10 @@ class RecheckReadsTheTabTty(IdleBase):
 # ------------------------------------------------------------------ the sort
 
 class SortBase(TempEnv):
-    # no wall-clock recheck slot: a poll crossing a 600 s boundary would change the signature
-    extra_config = {"tab_sort": "recent", "tab_sort_bucket_s": 0, "tab_sort_recheck_s": 0}
+    # no wall-clock recheck slot: a poll crossing a 600 s boundary would change the signature;
+    # quiet and min interval of 10 s so the +5/+20/+31 steps below stay meaningful
+    extra_config = {"tab_sort": "recent", "tab_sort_bucket_s": 0, "tab_sort_recheck_s": 0,
+                    "tab_sort_quiet_s": 10, "tab_sort_min_interval_s": 10}
 
     def setUp(self):
         super().setUp()
@@ -564,7 +566,7 @@ class SortLoop(SortBase):
         d = self.daemon([])
         calls = []
 
-        async def poll():
+        async def poll(trigger=None):
             calls.append(1)
             if len(calls) < 3:
                 raise RuntimeError("bug")
@@ -578,11 +580,14 @@ class SortLoop(SortBase):
         self.assertEqual(len([m for m in logs.output if "tab sort failed" in m]), 2)
 
     def test_run_loops_starts_the_sort_loop(self):
+        with ledger.tx(self.conn):
+            ledger.set_meta(self.conn, "probe", 1)  # the -wal file exists from the first write
         d = self.daemon([])
-        started = []
+        started, armed = [], []
 
         async def fake(name):
             started.append(name)
+            armed.append(d.watch is not None and d.watch.fd is not None)
             await asyncio.sleep(10)
 
         async def dies():
@@ -594,6 +599,8 @@ class SortLoop(SortBase):
         with self.assertRaises(D.ConnectionLost):
             arun(d.run_loops())
         self.assertIn("sort", started)
+        self.assertTrue(armed and all(armed), armed)  # the ledger watch runs with the loops
+        self.assertIsNone(d.watch.kq)  # and is stopped with them
 
 
 class CurrentTab(SortBase):

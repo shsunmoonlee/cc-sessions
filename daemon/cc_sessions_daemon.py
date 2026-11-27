@@ -25,6 +25,7 @@ import json
 import logging
 import logging.handlers
 import os
+import select
 import signal
 import stat
 import subprocess
@@ -62,6 +63,10 @@ REQUEST_RETRY = object()  # do_request: leave the request queued for the next po
 SESSION_END_WAIT_S = 5
 TAB_SHELL_WAIT_S = 20
 REQUEST_POLL_S = 5
+# a sort pass that stays incomplete (skipped panes, a restore running) is retried after
+# this, doubling up to the cap; a completed pass resets it
+SORT_BACKOFF_S = 5
+SORT_BACKOFF_MAX_S = 60
 REAP_EVERY_S = 3600
 PRUNE_EVERY_S = 3600
 ON_EVICT_TIMEOUT_S = 30
@@ -1282,6 +1287,153 @@ def _current_tab_id(w):
     return cur.tab_id if cur is not None else None
 
 
+def _moved_tabs(order):
+    """The fewest tabs that, picked up and put back, turn the old order into `order` (the
+    old indexes at their new positions): every tab outside one longest run already in
+    order. -> their old indexes."""
+    best, back = [1] * len(order), [-1] * len(order)
+    for j in range(len(order)):
+        for i in range(j):
+            if order[i] < order[j] and best[i] + 1 > best[j]:
+                best[j], back[j] = best[i] + 1, i
+    keep = set()
+    j = max(range(len(order)), key=best.__getitem__) if order else -1
+    while j >= 0:
+        keep.add(order[j])
+        j = back[j]
+    return [i for i in order if i not in keep]
+
+
+class Wake(object):
+    """Ends one loop's wait early: a ledger write, a tab switch, a deadline. The first
+    reason since the loop last woke is the trigger. The future is made inside wait, on the
+    running loop, never at construction."""
+
+    def __init__(self):
+        self.why = None
+        self.fut = None
+
+    def set(self, why):
+        if self.why is None:
+            self.why = why
+        if self.fut is not None and not self.fut.done():
+            self.fut.set_result(None)
+
+    async def wait(self, timeout):
+        """-> the trigger, or None when the timeout ran out first."""
+        if self.why is None:
+            self.fut = asyncio.get_running_loop().create_future()
+            try:
+                await asyncio.wait_for(self.fut, timeout)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                self.fut = None
+        why, self.why = self.why, None
+        return why
+
+
+class LedgerWatch(object):
+    """kqueue on the ledger's -wal file: every writer (hooks, the CLI, this daemon) appends
+    to it and a reader never does, so a write wakes the loops in well under a second. The
+    daemon's own writes wake it too; the loop finds nothing and waits again. A burst of
+    writes is one wake DEBOUNCE_S after its first. The -wal file can be missing (no writer
+    yet) or replaced: ensure() arms it again. Any error removes the reader for good, never
+    a hot loop on a readable fd, and the loops live on their safety timeout."""
+
+    DEBOUNCE_S = 0.3
+
+    def __init__(self, path, on_write):
+        self.path, self.on_write = path, on_write
+        self.loop = self.kq = self.fd = self.timer = None
+        self.first = None
+        self.again = False  # an event came while the debounce timer was pending
+        self.dead = False
+
+    def start(self, loop):
+        """-> True when the reader is on the loop."""
+        if not hasattr(select, "kqueue"):
+            self.dead = True
+            return False
+        try:
+            self.loop, self.kq = loop, select.kqueue()
+            loop.add_reader(self.kq.fileno(), self._ready)
+        except Exception as exc:
+            self._fail(exc)
+            return False
+        self.ensure()
+        return True
+
+    def ensure(self):
+        """Watch the -wal file when nothing is watched (missing at start, or replaced)."""
+        if self.dead or self.kq is None or self.fd is not None:
+            return
+        try:
+            fd = os.open(self.path, getattr(os, "O_EVTONLY", os.O_RDONLY))
+        except OSError:
+            return
+        try:
+            self.kq.control([select.kevent(
+                fd, filter=select.KQ_FILTER_VNODE, flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE |
+                select.KQ_NOTE_RENAME)], 0, 0)
+        except Exception as exc:
+            os.close(fd)
+            self._fail(exc)
+            return
+        self.fd = fd
+
+    def _ready(self):
+        try:
+            evs = self.kq.control(None, 16, 0)
+            if any(e.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME) for e in evs):
+                self._close_fd()
+                self.ensure()
+            if evs and self.timer is not None:
+                self.again = True
+            elif evs:
+                self.first = time.time()
+                self.timer = self.loop.call_later(self.DEBOUNCE_S, self._fire)
+        except Exception as exc:
+            self._fail(exc)
+
+    def _fire(self):
+        """NOTE_WRITE can come before the commit is visible: a write that landed while the
+        timer was pending gets one more wake after this one."""
+        self.timer = None
+        try:
+            self.on_write(self.first)
+        except Exception as exc:
+            self._fail(exc)
+            return
+        if self.again:
+            self.again = False
+            self.first = time.time()
+            self.timer = self.loop.call_later(self.DEBOUNCE_S, self._fire)
+
+    def _close_fd(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def _fail(self, exc):
+        if not self.dead:
+            log.warning("ledger watch failed (%s); the loops fall back to their safety poll", exc)
+        self.dead = True
+        self.stop()
+
+    def stop(self):
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+        if self.kq is not None:
+            with contextlib.suppress(Exception):
+                self.loop.remove_reader(self.kq.fileno())
+            self.kq.close()
+            self.kq = None
+        self._close_fd()
+
+
 def tab_layout(app, tty_guid):
     """The ordered windows, tabs and panes for a tab snapshot, from what the app already
     knows plus focus_snapshot's tty_guid inverted: no RPC."""
@@ -1326,9 +1478,24 @@ class Daemon(object):
         self.last_ghosts = 0.0
         # activity-driven tab sort (sort_loop)
         self.sort_sig = None  # signature of the inputs of the last completed pass
-        self.sort_started_at = 0.0
+        self.sorted_at = {}  # window id -> start of the last pass that sorted it
         self.win_seen = {}  # window id -> (tab ids, current tab id) at the previous poll
         self.quiet_until = {}  # window id -> no sort before this (you just switched or moved tabs)
+        self.focus_tab = {}  # window id -> the tab its last focus event selected (quiet stamped)
+        self.clock = time.time
+        self.sleep = asyncio.sleep
+        self.sort_last_pass = 0.0  # start of the last pass (the floor when no window gates)
+        self.request_hold = {}  # request id -> not before this (a REQUEST_RETRY waits its turn)
+        self.said = set()  # one-time warnings already logged
+        self.sort_wake, self.request_wake = Wake(), Wake()
+        self.watch = None  # LedgerWatch, started by run_loops
+        self.sort_due = None  # when the sort loop must look again (a deadline a poll asked for)
+        self.sort_changed_at = None  # the first change no completed pass has covered yet (lag)
+        self.sort_backoff = 0.0
+        self.sort_retry_at = 0.0  # no pass before this after an incomplete one
+        self.sort_failed = False  # the last pass was cut short (not just quiet windows left)
+        self.sort_defer = None  # earliest end of a quiet period the last pass waited out
+        self.sort_moved = []  # tab ids the last pass moved
         # window id -> (tab ids before, tab ids asked for) of the last set_tabs, while the
         # model still shows the order from before it
         self.sort_expected = {}
@@ -1458,11 +1625,13 @@ class Daemon(object):
             return await self._sort_tabs(focus, force, now)
 
     async def _sort_tabs(self, focus, force=False, now=None):
+        self.sort_failed, self.sort_defer, self.sort_moved = True, None, []
         if await self.off(tab_snapshots.restore_running, self.cfg):
             return "a restore is running", False
         # any skipped pane would read as a non-Claude tab and get shoved to the back
         if focus.get("skipped", 0):
             return "snapshot skipped %d pane(s)" % focus["skipped"], False
+        self.sort_failed = False
         now = time.time() if now is None else now
         states = LIVE_STATES + PARKED_STATES
         rows = ledger.all_rows(self.conn, "ended_at IS NULL AND state IN (%s)" %
@@ -1480,9 +1649,12 @@ class Daemon(object):
             tabs = list(w.tabs)
             if len(tabs) < 2:
                 continue
-            if not force and now < self.quiet_until.get(w.window_id, 0):
+            quiet = self.quiet_until.get(w.window_id, 0)
+            if not force and now < quiet:
                 complete = False
+                self.sort_defer = quiet if self.sort_defer is None else min(self.sort_defer, quiet)
                 continue
+            self.sorted_at[w.window_id] = now
             cur = None if force else _current_tab_id(w)
             tab_rows = []
             for t in tabs:
@@ -1507,7 +1679,8 @@ class Daemon(object):
             # do again. A forced sort never trusts that (a notification may have been lost).
             if not force and self.sort_expected.get(w.window_id) == (ids, want):
                 continue
-            n = sum(1 for pos, i in enumerate(order) if pos != i)
+            moving = [ids[i] for i in _moved_tabs(order)]
+            n = len(moving)
             if self.dry_run:
                 log.info("DRY RUN would move %d tab(s) in window %s", n, w.window_id)
                 continue
@@ -1516,10 +1689,12 @@ class Daemon(object):
             if [t.tab_id for t in w.tabs] != ids:
                 log.info("tab sort: window %s changed during the pass; skipped", w.window_id)
                 complete = False
+                self._defer_user(w.window_id, now)
                 continue
             if not force and _current_tab_id(w) != cur:
                 log.info("tab sort: window %s switched tabs during the pass; skipped", w.window_id)
                 complete = False
+                self._defer_user(w.window_id, now)
                 continue
             await iterm_call(w.async_set_tabs([tabs[i] for i in order]), "set_tabs")
             self.sort_set[w.window_id] = want
@@ -1530,9 +1705,17 @@ class Daemon(object):
             else:
                 self.sort_expected[w.window_id] = (ids, want)
             moved += n
-        if moved:
-            log.info("tab sort moved %d tab(s)", moved)
+            self.sort_moved += moving
+        if moved and force:
+            log.info("tab sort moved %d tab(s): %s", moved, " ".join(map(str, self.sort_moved)))
         return "moved %d tab(s)" % moved, complete
+
+    def _defer_user(self, wid, now):
+        """A window you changed during the pass: no doubling backoff (that is for skipped
+        panes and a running restore), a flat retry at its quiet end, else SORT_BACKOFF_S."""
+        until = self.quiet_until.get(wid, 0)
+        until = until if until > now else now + SORT_BACKOFF_S
+        self.sort_defer = until if self.sort_defer is None else min(self.sort_defer, until)
 
     def _tab_orders(self, window_tab_rows, times, doc, bucket_s, now):
         """The blocking half of a sort, one pass for every window (work_reason and the
@@ -1551,8 +1734,10 @@ class Daemon(object):
     def observe_windows(self, now):
         """Once per sort poll: a window whose current tab changed since the previous poll, or
         whose tab order changed in a way set_tabs did not ask for (a drag, a new or closed
-        tab), is quiet for tab_sort_quiet_s. An expectation ends once the model shows anything
-        but the order from before set_tabs: the order asked for, or whatever you made it."""
+        tab), is quiet for tab_sort_quiet_s. A switch to the tab a focus event already stamped
+        (stamp_focus, at receipt) is not stamped again here. An expectation ends once the model
+        shows anything but the order from before set_tabs: the order asked for, or whatever
+        you made it."""
         quiet_s = float(self.cfg.get("tab_sort_quiet_s") or 0)
         seen = {}
         for w in self.app.terminal_windows:
@@ -1564,12 +1749,16 @@ class Daemon(object):
             prev = self.win_seen.get(wid)
             if prev is not None:
                 moved = ids != prev[0] and ids != want
-                if (moved or cur != prev[1]) and quiet_s > 0:
+                switched = cur != prev[1] and cur != self.focus_tab.get(wid)
+                if (moved or switched) and quiet_s > 0:
                     self.quiet_until[wid] = now + quiet_s
+            if cur is not None and cur == self.focus_tab.get(wid):
+                del self.focus_tab[wid]  # seen: a later switch back to it is a new switch
             seen[wid] = (ids, cur)
         self.win_seen = seen
-        for wid in [k for k in self.quiet_until if k not in seen]:
-            del self.quiet_until[wid]
+        for table in (self.quiet_until, self.sorted_at, self.focus_tab):
+            for wid in [k for k in table if k not in seen]:
+                del table[wid]
         for wid in [k for k in self.sort_expected if k not in seen]:
             del self.sort_expected[wid]
 
@@ -1596,43 +1785,147 @@ class Daemon(object):
         every = float(self.cfg.get("tab_sort_recheck_s") or 0)
         return (top, rows, groups, wins, int(now // every) if every > 0 else 0)
 
-    async def sort_poll(self, now=None):
+    def stamp_focus(self, tab_id, now=None):
+        """A tab switch, at the moment its focus event arrives: the window is quiet from
+        now, not from the next poll that notices, and the sort loop wakes to schedule the
+        end of it. -> the window id, or None for a tab in no terminal window."""
+        now = self.clock() if now is None else now
+        for w in self.app.terminal_windows or ():
+            if any(t.tab_id == tab_id for t in w.tabs):
+                self.focus_tab[w.window_id] = tab_id
+                quiet_s = float(self.cfg.get("tab_sort_quiet_s") or 0)
+                if quiet_s > 0:
+                    self.quiet_until[w.window_id] = now + quiet_s
+                if self.sort_changed_at is None:
+                    self.sort_changed_at = now
+                self.sort_wake.set("focus")
+                return w.window_id
+        return None
+
+    def on_ledger_write(self, at):
+        """LedgerWatch: a write landed in the ledger at `at`; both loops look."""
+        if self.sort_changed_at is None:
+            self.sort_changed_at = at
+        self.sort_wake.set("event")
+        self.request_wake.set("event")
+
+    def say_once(self, key, msg, *args):
+        if key not in self.said:
+            self.said.add(key)
+            log.warning(msg, *args)
+
+    def knob_s(self, key, default, lo, hi):
+        """A seconds knob within lo..hi; anything that is not a number is the default."""
+        raw = self.cfg.get(key, default)
+        try:
+            v = float(raw)
+            if v != v:
+                raise ValueError(raw)
+        except (TypeError, ValueError):
+            self.say_once(key, "%s %r is not a number; using %s", key, raw, default)
+            return float(default)
+        return min(max(v, lo), hi)
+
+    def safety_s(self):
+        return self.knob_s("wake_safety_s", 30, 5.0, 300.0)
+
+    async def sort_poll(self, now=None, trigger=None):
         """One sort_loop step. The signature is taken before the pass reads anything, so
         activity during a pass makes another; it is kept only when the pass completed (not
         when a restore ran, panes were skipped, or a window was deferred or changed).
-        -> a word for tests."""
+        Every outcome that waits ("too soon", "quiet", "backoff", "incomplete") sets
+        sort_due to the moment it ends, else nothing wakes the loop until the safety poll.
+        tab_sort_min_interval_s is per window: a pass over one window never holds back
+        another whose quiet period just ended. -> a word for tests."""
+        self.sort_due = None
         if self.sort_mode() != "recent":
             return "off"
-        now = time.time() if now is None else now
+        now = self.clock() if now is None else now
+        every = float(self.cfg.get("tab_sort_recheck_s") or 0)
+        slot_end = (int(now // every) + 1) * every if every > 0 else None
         self.observe_windows(now)
         sig = self.sort_signature(now)
         if sig == self.sort_sig:
+            self.sort_changed_at, self.sort_backoff = None, 0.0
+            self.sort_due = slot_end
             return "unchanged"
-        if now - self.sort_started_at < float(self.cfg.get("tab_sort_min_interval_s") or 0):
+        if now < self.sort_retry_at:
+            self.sort_due = self.sort_retry_at
+            return "backoff"
+        # at least 1 s: 0 would be a pass on every debounced write
+        min_s = self.knob_s("tab_sort_min_interval_s", 2, 1.0, 3600.0)
+        sortable = [w.window_id for w in self.app.terminal_windows if len(w.tabs) >= 2]
+        opens = [max(self.quiet_until.get(wid, 0), self.sorted_at.get(wid, 0) + min_s)
+                 for wid in sortable]
+        if not opens:
+            # no window to gate on: every write would otherwise be a snapshot and a pass
+            opens = [self.sort_last_pass + min_s]
+        if now < min(opens):
+            self.sort_due = min(opens)
+            if sortable and all(now < self.quiet_until.get(wid, 0) for wid in sortable):
+                return "quiet"
             return "too soon"
-        sortable = [w for w in self.app.terminal_windows if len(w.tabs) >= 2]
-        if sortable and all(now < self.quiet_until.get(w.window_id, 0) for w in sortable):
-            return "quiet"
-        self.sort_started_at = now
+        self.sort_last_pass = now
+        lag = now - self.sort_changed_at if self.sort_changed_at is not None else None
+        t0 = time.monotonic()
         _, complete = await self.sort_pass(await self.snapshot(), now=now)
+        took = time.monotonic() - t0
         if complete:
             top, rows, groups, wins, slot = sig
             self.sort_sig = (top, rows, groups, tuple(
                 (wid, tuple(self.sort_set.get(wid) or self._shown_ids(wid, list(ids))), cur)
                 for wid, ids, cur in wins), slot)
+            self.sort_backoff, self.sort_retry_at, self.sort_changed_at = 0.0, 0.0, None
+            self.sort_due = slot_end
+        elif self.sort_failed:
+            self.sort_backoff = min(max(self.sort_backoff * 2, SORT_BACKOFF_S), SORT_BACKOFF_MAX_S)
+            self.sort_retry_at = self.sort_due = now + self.sort_backoff
+        else:
+            self.sort_due = self.sort_defer if self.sort_defer is not None else now + SORT_BACKOFF_S
+        moved = self.sort_moved
+        log.log(logging.INFO if moved or trigger == "safety" else logging.DEBUG,
+                "tab sort pass: trigger=%s lag=%s took=%.2fs moved %d tab(s)%s%s",
+                trigger, "-" if lag is None else "%.1fs" % lag, took, len(moved),
+                "".join(" %s" % t for t in moved), "" if complete else " (incomplete)")
         return "sorted" if complete else "incomplete"
 
     async def sort_loop(self):
-        """The activity-driven tab sort, every REQUEST_POLL_S. A sort bug is logged and never
-        ends the daemon; only a lost iTerm2 connection does."""
+        """The activity-driven tab sort. It waits for a ledger write, a tab switch, the
+        deadline its last poll asked for, or else wake_safety_s; a pass the safety timeout
+        found is logged with trigger=safety (the event path missed it). A sort bug is logged
+        and never ends the daemon; only a lost iTerm2 connection does."""
+        why = "start"
         while True:
             try:
-                await self.sort_poll()
+                await self.sort_poll(trigger=why)
             except ConnectionLost:
                 raise
             except Exception:
                 log.exception("tab sort failed")
-            await asyncio.sleep(REQUEST_POLL_S)
+                await self.sleep(REQUEST_POLL_S)  # a bug is not retried on every write
+                why = "deadline"
+                continue
+            why = await self.wait_wake(self.sort_wake, self.sort_due)
+
+    async def wait_wake(self, wake, due):
+        """Wait for `wake` until the deadline `due` (wall clock, None = none) or the safety
+        timeout. -> the trigger: the wake's own, else "deadline" or "safety"."""
+        now, safety = self.clock(), self.safety_s()
+        if self.watch is not None and self.watch.fd is None:
+            # no ledger watch (not armed yet, or failed): poll as often as before it existed
+            self.say_once("unarmed", "ledger watch is not armed; the loops poll every %ss",
+                          REQUEST_POLL_S)
+            safety = min(safety, REQUEST_POLL_S)
+        wait = safety if due is None else min(max(due - now, 0.01), safety)
+        why = await wake.wait(wait)
+        if why is None:
+            why = "deadline" if due is not None and due - now <= safety else "safety"
+            if self.watch is not None:
+                try:
+                    self.watch.ensure()
+                except Exception as exc:
+                    self.say_once("ensure", "ledger watch re-arm failed: %s", exc)
+        return why
 
     def heartbeat(self):
         now = time.time()
@@ -1921,10 +2214,24 @@ class Daemon(object):
                     raise ConnectionLost("%d consecutive tick failures" % failures)
             await asyncio.sleep(float(self.cfg["tick_s"]))
 
-    async def handle_requests(self):
+    async def handle_requests(self, hold=None):
+        """-> (requests done, requests left queued for a retry). hold (request_loop's): request
+        id -> not before; a REQUEST_RETRY is held REQUEST_POLL_S, so a wake from any ledger
+        write runs new requests at once and never retries one early."""
         rows = self.conn.execute("SELECT * FROM requests WHERE done_at IS NULL ORDER BY id").fetchall()
+        done = retry = 0
+        if hold is not None:
+            pending = {r["id"] for r in rows}
+            for rid in [k for k in hold if k not in pending]:
+                del hold[rid]
         for req in rows:
             req = dict(req)
+            if hold is not None:
+                now = self.clock()
+                # a hold further out than one retry means the clock stepped back: expired
+                if now < hold.get(req["id"], 0) <= now + REQUEST_POLL_S:
+                    retry += 1
+                    continue
             try:
                 result = await self.do_request(req)
             except ConnectionLost:
@@ -1933,10 +2240,17 @@ class Daemon(object):
                 log.exception("request %s failed", req["id"])
                 result = "error: %s" % exc
             if result is REQUEST_RETRY:
+                retry += 1
+                if hold is not None:
+                    hold[req["id"]] = self.clock() + REQUEST_POLL_S
                 continue
             with ledger.tx(self.conn):
                 self.conn.execute("UPDATE requests SET done_at=?, result=? WHERE id=?",
                                   (time.time(), result, req["id"]))
+            if hold is not None:
+                hold.pop(req["id"], None)
+            done += 1
+        return done, retry
 
     async def do_request(self, req):
         kind, sid = req["kind"], req.get("session_id")
@@ -2029,11 +2343,17 @@ class Daemon(object):
         return "resumed"
 
     async def request_loop(self):
-        failures = 0
+        """Requests run when a ledger write wakes the loop (the CLI's insert is one), else
+        every wake_safety_s, logged with trigger=safety when that found one. A request left
+        queued for a retry (REQUEST_RETRY) waits REQUEST_POLL_S whatever wakes the loop; a
+        failed poll sleeps REQUEST_POLL_S, ignoring wakes."""
+        failures, why = 0, "start"
         while True:
             try:
-                await self.handle_requests()
+                done, _ = await self.handle_requests(self.request_hold)
                 failures = 0
+                if done and why == "safety":
+                    log.info("requests: trigger=safety handled %d", done)
             except ConnectionLost:
                 raise
             except Exception:
@@ -2041,7 +2361,11 @@ class Daemon(object):
                 log.exception("request poll failed (%d in a row)", failures)
                 if failures >= self.MAX_TICK_FAILURES:
                     raise ConnectionLost("%d consecutive request-poll failures" % failures)
-            await asyncio.sleep(REQUEST_POLL_S)
+                await self.sleep(REQUEST_POLL_S)
+                why = "deadline"
+                continue
+            due = min(self.request_hold.values()) if self.request_hold else None
+            why = await self.wait_wake(self.request_wake, due)
 
     async def on_focus_change(self, session):
         focus = await self.snapshot()
@@ -2123,6 +2447,7 @@ class Daemon(object):
                 try:
                     s = None
                     if update.selected_tab_changed:
+                        self.stamp_focus(update.selected_tab_changed.tab_id)
                         tab = app.get_tab_by_id(update.selected_tab_changed.tab_id)
                         s = tab.current_session if tab else None
                     elif update.active_session_changed:
@@ -2140,6 +2465,11 @@ class Daemon(object):
     async def run_loops(self, loops=None):
         """Run the focus, tick, request and sort loops; the first one to fail cancels the others and
         its exception propagates, so main() exits for a clean restart instead of hanging."""
+        if loops is None:
+            # SQLite puts -wal beside the real file, not beside a symlink to it
+            self.watch = LedgerWatch(os.path.realpath(self.cfg.path("db")) + "-wal",
+                                     self.on_ledger_write)
+            self.watch.start(asyncio.get_running_loop())
         coros = loops or (self.focus_loop(), self.tick_loop(), self.request_loop(), self.sort_loop())
         tasks = [asyncio.ensure_future(c) for c in coros]
         try:
@@ -2150,6 +2480,8 @@ class Daemon(object):
                     t.cancel()
             # bounded: FocusMonitor's unsubscribe can wait forever on a dead dispatcher
             await asyncio.wait(tasks, timeout=CANCEL_WAIT_S)
+            if self.watch is not None:
+                self.watch.stop()
         for t in done:
             if not t.cancelled() and t.exception() is not None:
                 raise t.exception()

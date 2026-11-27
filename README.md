@@ -187,13 +187,16 @@ last, as they were. Activity is the newest prompt, turn end or finished subagent
 session's start or resume. A pinned, waiting or working tab stays in that section even when
 grouped. It does not change the selected tab, so it wakes nothing. `--all` sorts every window.
 
-With `tab_sort` set to `recent` the daemon keeps that order by itself. It checks every 5 s,
-with no iTerm2 call, whether anything a sort reads has changed: a hook event, a session's
-state, the groups file, a window's tabs or current tab, or a `tab_sort_recheck_s` slot passing
-(10 min, for what it cannot see, such as background work ending). Only then does it sort, at
-most once per `tab_sort_min_interval_s`, so a prompt or a turn end moves its tab within about
-10 s and an idle machine sorts at most once per recheck slot. The tab you are on keeps its
-place, and a window is left alone for `tab_sort_quiet_s` after you switch or drag tabs in it.
+With `tab_sort` set to `recent` the daemon keeps that order by itself. It wakes on a write to
+the ledger (kqueue on its `-wal` file), a tab switch, or a deadline it set itself, else every
+`wake_safety_s`, and checks with no iTerm2 call whether anything a sort reads has changed: a
+hook event, a session's state, the groups file, a window's tabs or current tab, or a
+`tab_sort_recheck_s` slot passing (10 min, for what it cannot see, such as background work
+ending). Only then does it sort: a pass at most once per `tab_sort_min_interval_s`, plus one
+when a window's quiet period ends, so a prompt or a turn end moves its tab within about a
+second and an idle machine sorts at most once per recheck slot. The tab you are on keeps its
+place, and a window is left alone for `tab_sort_quiet_s` after you switch or drag tabs in it;
+the sort runs when that ends.
 The menu's Sort, `cc-tabs sort`, still sorts everything at once.
 
 **Find** (`Find session`, ⌃⌥⌘F): search by title, group or folder. Enter selects the tab, which
@@ -272,9 +275,10 @@ path, `CC_SESSIONS_DB` the ledger, `CC_SESSIONS_LOG` the log). A config file tha
 | `groups_file` | `cc-sessions-groups.json` beside the ledger | manual groups and pins |
 | `tab_sort` | `off` | `recent`: the daemon keeps tabs in sort order after activity (see Tabs) |
 | `tab_sort_bucket_s` | 600 | tabs swap places by recency only across buckets this wide (0 = raw recency) |
-| `tab_sort_min_interval_s` | 10 | at most one automatic sort this often |
-| `tab_sort_quiet_s` | 10 | no sort of a window this long after you switch or move tabs in it |
+| `tab_sort_min_interval_s` | 2 | an automatic sort pass at most this often, plus one when a window's quiet period ends (at least 1) |
+| `tab_sort_quiet_s` | 3 | no sort of a window this long after you switch or move tabs in it |
 | `tab_sort_recheck_s` | 600 | an automatic sort this often even with no activity seen |
+| `wake_safety_s` | 30 | the sort and request loops look this often even when no ledger write or tab switch woke them |
 | `tty_refresh_s` | 600 | every pane's tty is re-read this often; in between only new tabs are read |
 | `ghost_reconcile_s` / `ghost_min_age_s` | 600 / 600 | how often the daemon ends non-interactive rows whose process is gone, once they have had no event this long |
 | `low_free_pct` / `high_free_pct` | 20 / 35 | evict below, stop at |
