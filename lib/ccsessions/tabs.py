@@ -29,7 +29,7 @@ VERSION = 1
 KEEP_FILES = 20
 SHRINK_KEEP_RATIO = 0.5
 TMP_MAX_AGE_S = 3600
-# `tabs --json` probes the lock every minute; a real run must not lose to that probe
+# `tabs --json` probes the lock on each menu refresh; a real run must not lose to that probe
 LOCK_TRIES = 3
 LOCK_RETRY_S = 0.05
 SNAP_RE = re.compile(r"^\d+-\d+(\.before-shrink-\d+)?\.json$")

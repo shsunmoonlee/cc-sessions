@@ -1889,7 +1889,7 @@ class IdleEstimate(ToolEnv):
 
 
 class RefreshNeedsNoApi(ToolEnv):
-    """The real commands the menu runs every minute, in a child process with iTerm2 "running"
+    """The real commands the menu runs on each refresh, in a child process with iTerm2 "running"
     (stub pgrep) and osascript stubbed: importing iterm2 at all, even inside a try, ends it."""
     BLOCK = ("import os, runpy, sys\n"
              "class Block:\n"

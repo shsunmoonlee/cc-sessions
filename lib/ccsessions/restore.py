@@ -165,7 +165,7 @@ def select_snapshot(snap, rows, cfg, alive_fn, live_guids, isdir=os.path.isdir, 
     non_claude the panes with no session. No age or count limit: the tab was open.
     `until` (tabs.next_instance_start) bounds the snapshot's instance: what ended after it
     was not killed with it. The cheap checks come first: `cc-sessions tabs` runs this for
-    the menu every minute, and alive_fn may run ps."""
+    the menu on each refresh, and alive_fn may run ps."""
     live_guids = live_guids or ()
     taken_at = snap.get("taken_at") or 0
     run, typed, skipped, non_claude = [], [], [], []
