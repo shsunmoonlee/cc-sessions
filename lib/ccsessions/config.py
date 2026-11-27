@@ -67,12 +67,15 @@ DEFAULTS = {
     # tabs swap places by recency only across buckets this many seconds wide, so the
     # tab bar never dances on every hook event (0 = raw recency)
     "tab_sort_bucket_s": 600,
-    # at most one activity-driven sort pass this often
-    "tab_sort_min_interval_s": 10,
+    # an activity-driven sort pass looks at a window at most this often
+    "tab_sort_min_interval_s": 2,
     # a window is not sorted this long after you switch tabs or move a tab in it
-    "tab_sort_quiet_s": 10,
+    "tab_sort_quiet_s": 3,
     # a sort pass this often even with no activity seen (ages, background work ending)
     "tab_sort_recheck_s": 600,
+    # the sort and request loops wake on a ledger write or a tab switch; with neither they
+    # still look this often (a pass this finds is logged trigger=safety)
+    "wake_safety_s": 30,
     # every pane's tty is re-read over the API this often; in between only new tabs are
     "tty_refresh_s": 600,
     # how often the daemon ends non-interactive rows whose process is gone
